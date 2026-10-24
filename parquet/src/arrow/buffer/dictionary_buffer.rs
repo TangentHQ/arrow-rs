@@ -34,8 +34,14 @@ use std::sync::Arc;
 /// An array of variable length byte arrays that are potentially dictionary encoded
 /// and can be converted into a corresponding [`ArrayRef`]
 pub enum DictionaryBuffer<K: ArrowNativeType, V: OffsetSizeTrait> {
-    Dict { keys: Vec<K>, values: ArrayRef },
-    Values { values: OffsetBuffer<V> },
+    Dict {
+        keys: Vec<K>,
+        values: ArrayRef,
+        memory: Option<Arc<dyn crate::arrow::memory::Allocation>>,
+    },
+    Values {
+        values: OffsetBuffer<V>,
+    },
 }
 
 impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
@@ -44,6 +50,13 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
         match self {
             Self::Dict { keys, .. } => keys.len(),
             Self::Values { values } => values.len(),
+        }
+    }
+
+    pub(crate) fn governed(&self) -> bool {
+        match self {
+            Self::Values { values } => values.memory.is_some(),
+            Self::Dict { memory, .. } => memory.is_some(),
         }
     }
 
@@ -58,7 +71,7 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
         assert!(K::from_usize(dictionary.len()).is_some());
 
         match self {
-            Self::Dict { keys, values } => {
+            Self::Dict { keys, values, .. } => {
                 // Need to discard fat pointer for equality check
                 // - https://stackoverflow.com/a/67114787
                 // - https://github.com/rust-lang/rust/issues/46139
@@ -76,6 +89,7 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
             Self::Values { values } if values.is_empty() => {
                 *self = Self::Dict {
                     keys: Default::default(),
+                    memory: values.memory.clone(),
                     values: Arc::clone(dictionary),
                 };
                 match self {
@@ -94,8 +108,13 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
     pub fn spill_values(&mut self) -> Result<&mut OffsetBuffer<V>> {
         match self {
             Self::Values { values } => Ok(values),
-            Self::Dict { keys, values } => {
+            Self::Dict {
+                keys,
+                values,
+                memory,
+            } => {
                 let mut spilled = OffsetBuffer::with_capacity(0);
+                spilled.memory = memory.clone();
                 let data = values.to_data();
                 let dict_buffers = data.buffers();
                 let dict_offsets = dict_buffers[0].typed_data::<V>();
@@ -131,7 +150,7 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
         assert!(matches!(data_type, ArrowType::Dictionary(_, _)));
 
         match self {
-            Self::Dict { keys, values } => {
+            Self::Dict { keys, values, .. } => {
                 // Validate keys unless dictionary is empty
                 if !values.is_empty() {
                     let min = K::from_usize(0).unwrap();
@@ -186,6 +205,28 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
                     _ => unreachable!(),
                 };
 
+                if let Some(memory) = &values.memory {
+                    // Packing can allocate a second values buffer plus the
+                    // native dictionary builder's keys/offsets/hash table.
+                    // Its minimum dictionary capacity is 1024; 64 bytes per
+                    // slot covers the table's power-of-two capacity, control
+                    // bytes, keys, offsets and validity. Payload may grow 2x.
+                    let payload = values
+                        .values
+                        .len()
+                        .checked_mul(2)
+                        .ok_or_else(|| general_err!("Dictionary byte capacity overflow"))?;
+                    let cells = values
+                        .len()
+                        .max(1024)
+                        .checked_mul(64)
+                        .ok_or_else(|| general_err!("Dictionary cell capacity overflow"))?;
+                    memory.grow(
+                        payload
+                            .checked_add(cells)
+                            .ok_or_else(|| general_err!("Dictionary capacity overflow"))?,
+                    )?;
+                }
                 let array = values.into_array(null_buffer, value_type);
                 pack_values(key_type, &array)
             }
@@ -194,6 +235,16 @@ impl<K: ArrowNativeType + Ord, V: OffsetSizeTrait> DictionaryBuffer<K, V> {
 }
 
 impl<K: ArrowNativeType, V: OffsetSizeTrait> ValuesBuffer for DictionaryBuffer<K, V> {
+    fn set_memory(&mut self, memory: Option<Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        let memory = memory.map(|memory| memory as Arc<dyn crate::arrow::memory::Allocation>);
+        match self {
+            Self::Values { values } => values.memory = memory,
+            Self::Dict {
+                memory: current, ..
+            } => *current = memory,
+        }
+    }
+
     fn with_capacity(capacity: usize) -> Self {
         Self::Values {
             values: OffsetBuffer::with_capacity(capacity),

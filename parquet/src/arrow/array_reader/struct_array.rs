@@ -59,6 +59,12 @@ impl StructArrayReader {
 }
 
 impl ArrayReader for StructArrayReader {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        for child in &mut self.children {
+            child.set_memory(memory.clone());
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

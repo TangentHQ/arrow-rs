@@ -202,6 +202,7 @@ pub type ParquetPushDecoderBuilder = ArrowReaderBuilder<PushDecoderInput>;
 pub struct PushDecoderInput {
     /// Bytes pushed into the decoder, awaiting decode.
     buffers: PushBuffers,
+    memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
 }
 
 /// Methods for building a ParquetDecoder. See the base [`ArrowReaderBuilder`] for
@@ -244,15 +245,30 @@ impl ParquetPushDecoderBuilder {
     /// from, so bytes already fetched are not requested again.
     pub fn with_buffers(self, buffers: PushBuffers) -> Self {
         Self {
-            input: PushDecoderInput { buffers },
+            input: PushDecoderInput {
+                buffers,
+                ..self.input
+            },
             ..self
         }
+    }
+
+    /// Install fallible native decoding admission. Governed readers use exact
+    /// selectors and disable the optional predicate cache.
+    pub fn with_decoder_memory(
+        mut self,
+        memory: Arc<dyn crate::arrow::memory::DecoderMemory>,
+    ) -> Self {
+        self.input.memory = Some(memory);
+        self.row_selection_policy = crate::arrow::arrow_reader::RowSelectionPolicy::Selectors;
+        self.max_predicate_cache_size = 0;
+        self
     }
 
     /// Create a [`ParquetPushDecoder`] with the configured options
     pub fn build(self) -> Result<ParquetPushDecoder, ParquetError> {
         let Self {
-            input: PushDecoderInput { buffers },
+            input: PushDecoderInput { buffers, memory },
             metadata: parquet_metadata,
             schema,
             fields,
@@ -267,6 +283,15 @@ impl ParquetPushDecoderBuilder {
             row_selection_policy,
             max_predicate_cache_size,
         } = self;
+
+        // Admission is independent of builder call order. Mask materialization
+        // can decode unselected rows, and cached predicate arrays need a
+        // separate allocation policy, so neither is enabled in governed scans.
+        let (row_selection_policy, max_predicate_cache_size) = if memory.is_some() {
+            (crate::arrow::arrow_reader::RowSelectionPolicy::Selectors, 0)
+        } else {
+            (row_selection_policy, max_predicate_cache_size)
+        };
 
         // If no row groups were specified, read all of them
         let row_groups =
@@ -288,6 +313,8 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
             buffers,
             row_selection_policy,
+            memory,
+            Arc::clone(&schema),
         );
 
         // Initialize the decoder with the configured options
@@ -332,10 +359,14 @@ fn builder_from_remaining(parts: RemainingRowGroupsParts) -> ParquetPushDecoderB
         metrics,
         row_selection_policy,
         buffers,
+        memory,
     } = reader_builder;
 
     ArrowReaderBuilder {
-        input: PushDecoderInput::default(),
+        input: PushDecoderInput {
+            memory,
+            ..Default::default()
+        },
         metadata,
         schema,
         fields,

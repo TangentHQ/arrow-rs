@@ -392,6 +392,12 @@ impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
 /// API for reading pages from a column chunk.
 /// This offers a iterator like API to get the next page.
 pub trait PageReader: Iterator<Item = Result<Page>> + Send {
+    /// Optional charge for the last returned page and its decoder scratch.
+    #[cfg(feature = "arrow")]
+    fn memory(&self) -> Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>> {
+        None
+    }
+
     /// Gets the next page in the column chunk associated with this reader.
     /// Returns `None` if there are no pages left.
     fn get_next_page(&mut self) -> Result<Option<Page>>;

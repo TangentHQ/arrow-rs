@@ -167,6 +167,10 @@ impl FixedLenByteArrayReader {
 }
 
 impl ArrayReader for FixedLenByteArrayReader {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.record_reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -286,6 +290,7 @@ struct FixedLenByteArrayBuffer {
     /// Preserved value-count hint used to allocate `buffer` once `byte_length`
     /// becomes known on the first decode.
     values_capacity: Option<usize>,
+    governed: bool,
 }
 
 #[inline]
@@ -312,11 +317,15 @@ fn move_values<F>(
 }
 
 impl ValuesBuffer for FixedLenByteArrayBuffer {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.governed = memory.is_some();
+    }
     fn with_capacity(capacity: usize) -> Self {
         // `byte_length` is not known initially, so preserve the value-count
         // hint so the first decode can allocate the initial byte capacity.
         Self {
             buffer: Vec::new(),
+            governed: false,
             byte_length: None,
             values_capacity: Some(capacity),
         }
@@ -381,15 +390,23 @@ impl ValuesBuffer for FixedLenByteArrayBuffer {
 
 struct ValueDecoder {
     byte_length: usize,
+    page_memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
     dict_page: Option<Bytes>,
     decoder: Option<Decoder>,
 }
 
 impl ColumnValueDecoder for ValueDecoder {
     type Buffer = FixedLenByteArrayBuffer;
+    fn set_page_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        self.page_memory = memory;
+    }
 
     fn new(col: &ColumnDescPtr) -> Self {
         Self {
+            page_memory: None,
             byte_length: col.type_length() as usize,
             dict_page: None,
             decoder: None,
@@ -440,9 +457,11 @@ impl ColumnValueDecoder for ValueDecoder {
             Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => Decoder::Dict {
                 decoder: DictIndexDecoder::new(data, num_levels, num_values)?,
             },
-            Encoding::DELTA_BYTE_ARRAY => Decoder::Delta {
-                decoder: DeltaByteArrayDecoder::new(data)?,
-            },
+            Encoding::DELTA_BYTE_ARRAY => {
+                let mut decoder = DeltaByteArrayDecoder::new_with_limit(data, num_levels)?;
+                decoder.set_memory(self.page_memory.clone());
+                Decoder::Delta { decoder }
+            }
             Encoding::BYTE_STREAM_SPLIT => Decoder::ByteStreamSplit {
                 buf: data,
                 offset: 0,
@@ -493,7 +512,11 @@ impl ColumnValueDecoder for ValueDecoder {
                 }
 
                 decoder.read(num_values, |keys| {
-                    out.buffer.reserve(keys.len() * self.byte_length);
+                    if out.governed {
+                        out.buffer.reserve_exact(keys.len() * self.byte_length);
+                    } else {
+                        out.buffer.reserve(keys.len() * self.byte_length);
+                    }
                     for key in keys {
                         let offset = *key as usize * self.byte_length;
                         let val = &dict.as_ref()[offset..offset + self.byte_length];
@@ -504,7 +527,11 @@ impl ColumnValueDecoder for ValueDecoder {
             }
             Decoder::Delta { decoder } => {
                 let to_read = num_values.min(decoder.remaining());
-                out.buffer.reserve(to_read * self.byte_length);
+                if out.governed {
+                    out.buffer.reserve_exact(to_read * self.byte_length);
+                } else {
+                    out.buffer.reserve(to_read * self.byte_length);
+                }
 
                 decoder.read(to_read, |slice| {
                     if slice.len() != self.byte_length {

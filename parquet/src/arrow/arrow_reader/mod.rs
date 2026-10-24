@@ -1389,6 +1389,7 @@ pub struct ParquetRecordBatchReader {
     array_reader: Box<dyn ArrayReader>,
     schema: SchemaRef,
     read_plan: ReadPlan,
+    memory: Option<crate::arrow::memory::BatchState>,
 }
 
 /// Accumulates filter masks for decoded chunks in one logical output batch.
@@ -1546,14 +1547,37 @@ impl Iterator for ParquetRecordBatchReader {
 }
 
 impl ParquetRecordBatchReader {
+    pub(crate) fn with_memory(mut self, memory: Option<crate::arrow::memory::BatchState>) -> Self {
+        self.memory = memory;
+        self
+    }
+
     /// Returns the next `RecordBatch` from the reader, or `None` if the reader
     /// has reached the end of the file.
     ///
     /// Returns `Result<Option<..>>` rather than `Option<Result<..>>` to
     /// simplify error handling with `?`
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
+        if self
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.remaining() == 0)
+        {
+            return Ok(None);
+        }
         let mut read_records = 0;
-        let batch_size = self.batch_size();
+        let reservation = self
+            .memory
+            .as_mut()
+            .map(|memory| memory.next(self.read_plan.batch_size()))
+            .transpose()?;
+        let batch_size = reservation
+            .as_ref()
+            .map(|memory| memory.rows)
+            .unwrap_or_else(|| self.batch_size());
+        if let Some(memory) = &reservation {
+            self.array_reader.set_memory(Some(memory.owner.clone()));
+        }
         if batch_size == 0 {
             return Ok(None);
         }
@@ -1606,6 +1630,20 @@ impl ParquetRecordBatchReader {
         }
 
         let batch = consume_record_batch(self.array_reader.as_mut())?;
+        if let Some(memory) = self.memory.as_mut() {
+            memory.advance(batch.num_rows());
+            // Native consume has replaced the previous def/rep buffers. Keep
+            // the new scratch until the next consume or reader drop; arrays
+            // receive only the independent output owner below.
+            memory.scratch = reservation
+                .as_ref()
+                .map(|reservation| reservation.scratch.clone());
+        }
+        let batch = if let Some(memory) = reservation {
+            memory.owner.retain(batch)?
+        } else {
+            batch
+        };
         Ok(if batch.num_rows() > 0 {
             Some(batch)
         } else {
@@ -1659,6 +1697,7 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(Schema::new(levels.fields.clone())),
             read_plan,
+            memory: None,
         })
     }
 
@@ -1675,6 +1714,7 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(schema),
             read_plan,
+            memory: None,
         }
     }
 

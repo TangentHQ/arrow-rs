@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::record_reader::buffer::ValuesBuffer;
-use crate::errors::Result;
+use crate::errors::{ParquetError, Result};
 use arrow_array::{ArrayRef, BinaryViewArray, StringViewArray};
 use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::DataType as ArrowType;
@@ -31,6 +31,7 @@ use std::sync::Arc;
 pub struct ViewBuffer {
     pub views: Vec<u128>,
     pub buffers: Vec<Buffer>,
+    pub(crate) memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>,
 }
 
 impl ViewBuffer {
@@ -39,11 +40,36 @@ impl ViewBuffer {
         Self {
             views: Vec::with_capacity(capacity),
             buffers: Vec::new(),
+            memory: None,
         }
     }
 
+    pub(crate) fn reserve_views(&mut self, additional: usize) {
+        if self.memory.is_some() {
+            self.views.reserve_exact(additional);
+        } else {
+            self.views.reserve(additional);
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.views.is_empty()
+    }
+
+    pub(crate) fn try_append_block(&mut self, block: Buffer) -> Result<u32> {
+        if let Some(memory) = &self.memory {
+            if self.buffers.len() == self.buffers.capacity() {
+                let previous = self.buffers.capacity();
+                let capacity = previous.saturating_mul(2).max(1);
+                let width = std::mem::size_of::<Buffer>();
+                let bytes = capacity
+                    .checked_mul(width)
+                    .ok_or_else(|| general_err!("View buffer descriptor overflow"))?;
+                memory.grow(bytes)?;
+                self.buffers.reserve_exact(capacity - self.buffers.len());
+                memory.shrink(previous * width);
+            }
+        }
+        Ok(self.append_block(block))
     }
 
     pub fn append_block(&mut self, block: Buffer) -> u32 {
@@ -72,6 +98,9 @@ impl ViewBuffer {
 }
 
 impl ValuesBuffer for ViewBuffer {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.memory = memory;
+    }
     fn with_capacity(capacity: usize) -> Self {
         Self::with_capacity(capacity)
     }

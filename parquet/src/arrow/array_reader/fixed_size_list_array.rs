@@ -29,6 +29,7 @@ use arrow_schema::DataType as ArrowType;
 /// Implementation of fixed-size list array reader.
 pub struct FixedSizeListArrayReader {
     item_reader: Box<dyn ArrayReader>,
+    memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>,
     /// The number of child items in each row of the list array
     fixed_size: usize,
     data_type: ArrowType,
@@ -60,6 +61,7 @@ impl FixedSizeListArrayReader {
     ) -> Self {
         Self {
             item_reader,
+            memory: None,
             fixed_size,
             data_type,
             def_level,
@@ -71,6 +73,11 @@ impl FixedSizeListArrayReader {
 }
 
 impl ArrayReader for FixedSizeListArrayReader {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.memory = memory.clone();
+        self.item_reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -167,6 +174,13 @@ impl ArrayReader for FixedSizeListArrayReader {
             child_array.to_data()
         } else {
             let data = child_array.to_data();
+            if let Some(memory) = &self.memory {
+                memory.grow(
+                    crate::arrow::memory::copied_bytes(&data)
+                        .checked_mul(2)
+                        .ok_or_else(|| general_err!("Nested byte capacity overflow"))?,
+                )?;
+            }
             let mut builder = MutableArrayData::new(vec![&data], true, list_len * self.fixed_size);
             let mut src_idx = 0;
             for &d in &boundary_defs {

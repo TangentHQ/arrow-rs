@@ -30,6 +30,7 @@ use std::sync::Arc;
 /// An in-memory collection of column chunks
 #[derive(Debug)]
 pub(crate) struct InMemoryRowGroup<'a> {
+    pub(crate) memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
     pub(crate) offset_index: Option<&'a [OffsetIndexMetaData]>,
     /// Column chunks for this row group
     pub(crate) column_chunks: Vec<Option<Arc<ColumnChunkData>>>,
@@ -48,6 +49,13 @@ pub(crate) struct FetchRanges {
 }
 
 impl InMemoryRowGroup<'_> {
+    pub(crate) fn with_memory(
+        mut self,
+        memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
+    ) -> Self {
+        self.memory = memory;
+        self
+    }
     /// Returns the byte ranges to fetch for the columns specified in
     /// `projection` and `selection`.
     ///
@@ -218,6 +226,8 @@ impl RowGroups for InMemoryRowGroup<'_> {
                     column_chunk_metadata,
                 )?;
 
+                let page_reader =
+                    page_reader.with_decoder_memory(self.memory.clone(), self.row_group_idx, i);
                 let page_reader: Box<dyn PageReader> = Box::new(page_reader);
 
                 Ok(Box::new(ColumnChunkIterator {

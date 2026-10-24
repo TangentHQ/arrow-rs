@@ -38,6 +38,7 @@ pub struct PredicateOptions<'a> {
     predicate: &'a mut dyn ArrowPredicate,
     limit: Option<usize>,
     total_rows: usize,
+    memory: Option<crate::arrow::memory::BatchState>,
 }
 
 impl<'a> PredicateOptions<'a> {
@@ -53,7 +54,13 @@ impl<'a> PredicateOptions<'a> {
             predicate,
             limit: None,
             total_rows: 0,
+            memory: None,
         }
+    }
+
+    pub(crate) fn with_memory(mut self, memory: Option<crate::arrow::memory::BatchState>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Stop scanning `array_reader` once `limit` matches have accumulated.
@@ -201,6 +208,7 @@ impl ReadPlanBuilder {
             predicate,
             limit,
             total_rows,
+            memory,
         } = options;
 
         // Target length for the concatenated filter output:
@@ -214,7 +222,8 @@ impl ReadPlanBuilder {
             None => limit.map(|_| total_rows),
         };
 
-        let reader = ParquetRecordBatchReader::new(array_reader, self.clone().build());
+        let reader =
+            ParquetRecordBatchReader::new(array_reader, self.clone().build()).with_memory(memory);
         let mut filters = vec![];
         let mut processed_rows: usize = 0;
         let mut matched_rows: usize = 0;

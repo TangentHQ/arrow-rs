@@ -30,6 +30,7 @@ use arrow_schema::DataType as ArrowType;
 pub struct OffsetBuffer<I: OffsetSizeTrait> {
     pub offsets: Vec<I>,
     pub values: Vec<u8>,
+    pub(crate) memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
 }
 
 impl<I: OffsetSizeTrait> OffsetBuffer<I> {
@@ -43,7 +44,28 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
         Self {
             offsets,
             values: Vec::new(),
+            memory: None,
         }
+    }
+
+    pub(crate) fn reserve_offsets(&mut self, additional: usize) {
+        if self.memory.is_some() {
+            self.offsets.reserve_exact(additional);
+        } else {
+            self.offsets.reserve(additional);
+        }
+    }
+    pub(crate) fn governed(&self) -> bool {
+        self.memory.is_some()
+    }
+    pub(crate) fn reserve_values(&mut self, bytes: usize) -> Result<()> {
+        crate::arrow::memory::reserve(
+            &mut self.values,
+            bytes,
+            self.memory
+                .as_deref()
+                .map(|value| value as &dyn crate::arrow::memory::Allocation),
+        )
     }
 
     /// Returns the number of byte arrays in this buffer
@@ -74,11 +96,15 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
             }
         }
 
+        self.reserve_values(data.len())?;
         self.values.extend_from_slice(data);
 
         let index_offset = I::from_usize(self.values.len())
             .ok_or_else(|| general_err!("index overflow decoding byte array"))?;
 
+        if self.memory.is_some() {
+            self.offsets.reserve_exact(1);
+        }
         self.offsets.push(index_offset);
         Ok(())
     }
@@ -95,7 +121,7 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
         dict_offsets: &[V],
         dict_values: &[u8],
     ) -> Result<()> {
-        self.offsets.reserve(keys.len());
+        self.reserve_offsets(keys.len());
 
         for key in keys {
             let index = key.as_usize();
@@ -109,10 +135,14 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
             let end_offset = dict_offsets[index + 1].as_usize();
 
             // Dictionary values are verified when decoding dictionary page
+            self.reserve_values(end_offset - start_offset)?;
             self.values
                 .extend_from_slice(&dict_values[start_offset..end_offset]);
             let index_offset = I::from_usize(self.values.len())
                 .ok_or_else(|| general_err!("index overflow decoding byte array"))?;
+            if self.memory.is_some() {
+                self.offsets.reserve_exact(1);
+            }
             self.offsets.push(index_offset);
         }
         Ok(())
@@ -147,6 +177,10 @@ impl<I: OffsetSizeTrait> OffsetBuffer<I> {
 }
 
 impl<I: OffsetSizeTrait> ValuesBuffer for OffsetBuffer<I> {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.memory =
+            memory.map(|memory| memory as std::sync::Arc<dyn crate::arrow::memory::Allocation>);
+    }
     fn with_capacity(capacity: usize) -> Self {
         Self::with_capacity(capacity)
     }

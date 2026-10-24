@@ -29,15 +29,19 @@ pub struct DeltaByteArrayDecoder {
     length_offset: usize,
     data_offset: usize,
     last_value: Vec<u8>,
+    memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
 }
 
 impl DeltaByteArrayDecoder {
     /// Create a new [`DeltaByteArrayDecoder`] with the provided data page
-    pub fn new(data: Bytes) -> Result<Self> {
+    pub(crate) fn new_with_limit(data: Bytes, limit: usize) -> Result<Self> {
         let mut prefix = DeltaBitPackDecoder::<Int32Type>::new();
         prefix.set_data(data.clone(), 0)?;
 
         let num_prefix = prefix.values_left();
+        if num_prefix > limit {
+            return Err(general_err!("Delta prefix count exceeds page values"));
+        }
         let mut prefix_lengths = vec![0; num_prefix];
         assert_eq!(prefix.get(&mut prefix_lengths)?, num_prefix);
 
@@ -45,6 +49,9 @@ impl DeltaByteArrayDecoder {
         suffix.set_data(data.slice(prefix.get_offset()..), 0)?;
 
         let num_suffix = suffix.values_left();
+        if num_suffix > limit {
+            return Err(general_err!("Delta suffix count exceeds page values"));
+        }
         let mut suffix_lengths = vec![0; num_suffix];
         assert_eq!(suffix.get(&mut suffix_lengths)?, num_suffix);
 
@@ -63,7 +70,15 @@ impl DeltaByteArrayDecoder {
             length_offset: 0,
             data_offset: prefix.get_offset() + suffix.get_offset(),
             last_value: vec![],
+            memory: None,
         })
+    }
+
+    pub(crate) fn set_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        self.memory = memory;
     }
 
     /// Returns the number of values remaining
@@ -96,7 +111,15 @@ impl DeltaByteArrayDecoder {
                 return Err(ParquetError::EOF("eof decoding byte array".into()));
             }
 
+            if prefix_length > self.last_value.len() {
+                return Err(general_err!("Invalid delta prefix length"));
+            }
             self.last_value.truncate(prefix_length);
+            crate::arrow::memory::reserve(
+                &mut self.last_value,
+                suffix_length,
+                self.memory.as_deref(),
+            )?;
             self.last_value
                 .extend_from_slice(&data[self.data_offset..self.data_offset + suffix_length]);
             f(&self.last_value)?;
@@ -127,7 +150,15 @@ impl DeltaByteArrayDecoder {
                 return Err(ParquetError::EOF("eof decoding byte array".into()));
             }
 
+            if prefix_length > self.last_value.len() {
+                return Err(general_err!("Invalid delta prefix length"));
+            }
             self.last_value.truncate(prefix_length);
+            crate::arrow::memory::reserve(
+                &mut self.last_value,
+                suffix_length,
+                self.memory.as_deref(),
+            )?;
             self.last_value
                 .extend_from_slice(&data[self.data_offset..self.data_offset + suffix_length]);
             self.data_offset += suffix_length;

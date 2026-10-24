@@ -409,7 +409,11 @@ where
     /// Read the next page as a dictionary page. If the next page is not a dictionary page,
     /// this will return an error.
     fn read_dictionary_page(&mut self) -> Result<()> {
-        match self.page_reader.get_next_page()? {
+        let page = self.page_reader.get_next_page()?;
+        #[cfg(feature = "arrow")]
+        self.values_decoder
+            .set_page_memory(self.page_reader.memory());
+        match page {
             Some(Page::DictionaryPage {
                 buf,
                 num_values,
@@ -432,6 +436,9 @@ where
                 // No more page to read
                 None => return Ok(false),
                 Some(current_page) => {
+                    #[cfg(feature = "arrow")]
+                    self.values_decoder
+                        .set_page_memory(self.page_reader.memory());
                     match current_page {
                         // 1. Dictionary page: configure dictionary for this page.
                         Page::DictionaryPage {

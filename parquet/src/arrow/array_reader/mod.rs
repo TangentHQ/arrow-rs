@@ -101,6 +101,9 @@ pub trait ArrayReader: Send {
         self.consume_batch()
     }
 
+    /// Install the already admitted selected-batch owner before any value growth.
+    fn set_memory(&mut self, _memory: Option<Arc<dyn crate::arrow::memory::BatchOwner>>) {}
+
     /// Reads at most `batch_size` records' bytes into buffer
     ///
     /// Returns the number of records read, which can be less than `batch_size` if

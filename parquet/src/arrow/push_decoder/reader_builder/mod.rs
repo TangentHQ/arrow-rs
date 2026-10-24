@@ -48,6 +48,7 @@ struct RowGroupInfo {
     row_count: usize,
     plan_builder: ReadPlanBuilder,
     budget: RowBudget,
+    scope: Option<Arc<dyn crate::arrow::memory::Allocation>>,
 }
 
 /// This is the inner state machine for reading a single row group.
@@ -239,6 +240,8 @@ impl NextState {
 pub(crate) struct RowGroupReaderBuilder {
     /// The output batch size
     batch_size: usize,
+    memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
+    schema: Arc<arrow_schema::Schema>,
 
     /// What columns to project (produce in each output batch)
     projection: ProjectionMask,
@@ -281,6 +284,7 @@ pub(crate) struct RowGroupReaderBuilder {
 #[derive(Debug)]
 pub(crate) struct RowGroupReaderBuilderParts {
     pub batch_size: usize,
+    pub memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
     pub projection: ProjectionMask,
     pub fields: Option<Arc<ParquetField>>,
     pub filter: Option<RowFilter>,
@@ -305,9 +309,13 @@ impl RowGroupReaderBuilder {
         max_predicate_cache_size: usize,
         buffers: PushBuffers,
         row_selection_policy: RowSelectionPolicy,
+        memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
+        schema: Arc<arrow_schema::Schema>,
     ) -> Self {
         Self {
             batch_size,
+            memory,
+            schema,
             projection,
             metadata,
             fields,
@@ -328,6 +336,8 @@ impl RowGroupReaderBuilder {
         // or at least evaluate how it should be handled in the decomposition and reconstruction of the builder.
         let Self {
             batch_size,
+            memory,
+            schema: _,
             projection,
             metadata: _,
             fields,
@@ -340,6 +350,8 @@ impl RowGroupReaderBuilder {
         } = self;
         RowGroupReaderBuilderParts {
             batch_size,
+            memory,
+
             projection,
             fields,
             filter,
@@ -411,11 +423,26 @@ impl RowGroupReaderBuilder {
             .with_selection(selection)
             .with_row_selection_policy(self.row_selection_policy);
 
+        let scope = self
+            .memory
+            .as_ref()
+            .map(|memory| {
+                memory.row_group(&crate::arrow::memory::RowGroupMemory {
+                    metadata: &self.metadata,
+                    row_group: row_group_idx,
+                    predicates: self
+                        .filter
+                        .as_ref()
+                        .is_some_and(|filter| !filter.predicates.is_empty()),
+                })
+            })
+            .transpose()?;
         let row_group_info = RowGroupInfo {
             row_group_idx,
             row_count,
             plan_builder,
             budget,
+            scope,
         };
 
         self.state = Some(RowGroupDecoderState::Start { row_group_info });
@@ -523,6 +550,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     plan_builder,
                     budget,
+                    scope,
                 } = row_group_info;
 
                 // If nothing is selected, we are done with this row group
@@ -562,6 +590,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     plan_builder,
                     budget,
+                    scope,
                 };
 
                 NextState::again(RowGroupDecoderState::WaitingOnFilterData {
@@ -595,6 +624,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     mut plan_builder,
                     budget,
+                    scope,
                 } = row_group_info;
 
                 let predicate = filter_info.current();
@@ -606,11 +636,24 @@ impl RowGroupReaderBuilder {
                     predicate.projection(),
                     &mut self.buffers,
                 )?;
+                let row_group = row_group.with_memory(self.memory.clone());
 
                 let cache_options = filter_info.cache_builder().producer();
 
+                let mut admission = self.admission(
+                    row_group_idx,
+                    predicate.projection(),
+                    plan_builder.selection(),
+                    scope.clone(),
+                    true,
+                );
+                let size = admission
+                    .as_mut()
+                    .map(|memory| memory.prepare(self.batch_size))
+                    .transpose()?
+                    .unwrap_or(self.batch_size);
                 let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                    .with_batch_size(self.batch_size)
+                    .with_batch_size(size)
                     .with_cache_options(Some(&cache_options))
                     .with_parquet_metadata(&self.metadata)
                     .build_array_reader(self.fields.as_deref(), predicate.projection())?;
@@ -639,7 +682,8 @@ impl RowGroupReaderBuilder {
                 // early termination when this is the final predicate and an
                 // output limit was set.
                 let mut predicate_options =
-                    PredicateOptions::new(array_reader, filter_info.current_mut());
+                    PredicateOptions::new(array_reader, filter_info.current_mut())
+                        .with_memory(admission);
                 if let Some(limit) = predicate_limit {
                     predicate_options = predicate_options.with_limit(limit, row_count);
                 }
@@ -650,6 +694,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     plan_builder,
                     budget,
+                    scope,
                 };
 
                 // Take back the column chunks that were read
@@ -687,6 +732,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     plan_builder,
                     budget,
+                    scope,
                 } = row_group_info;
 
                 let BudgetedReadPlan {
@@ -739,6 +785,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     plan_builder,
                     budget: remaining_budget,
+                    scope,
                 };
 
                 NextState::again(RowGroupDecoderState::WaitingOnData {
@@ -772,6 +819,7 @@ impl RowGroupReaderBuilder {
                     row_count,
                     plan_builder,
                     budget,
+                    scope,
                 } = row_group_info;
 
                 let row_group = data_request.try_into_in_memory_row_group(
@@ -781,12 +829,25 @@ impl RowGroupReaderBuilder {
                     &self.projection,
                     &mut self.buffers,
                 )?;
+                let row_group = row_group.with_memory(self.memory.clone());
 
+                let mut admission = self.admission(
+                    row_group_idx,
+                    &self.projection,
+                    plan_builder.selection(),
+                    scope,
+                    false,
+                );
+                let size = admission
+                    .as_mut()
+                    .map(|memory| memory.prepare(self.batch_size))
+                    .transpose()?
+                    .unwrap_or(self.batch_size);
                 let plan = plan_builder.build();
 
                 // if we have any cached results, connect them up
                 let array_reader_builder = ArrayReaderBuilder::new(&row_group, &self.metrics)
-                    .with_batch_size(self.batch_size)
+                    .with_batch_size(size)
                     .with_parquet_metadata(&self.metadata);
                 let array_reader = if let Some(cache_info) = cache_info.as_ref() {
                     let cache_options: CacheOptions = cache_info.builder().consumer();
@@ -798,7 +859,8 @@ impl RowGroupReaderBuilder {
                         .build_array_reader(self.fields.as_deref(), &self.projection)
                 }?;
 
-                let reader = ParquetRecordBatchReader::new(array_reader, plan);
+                let reader =
+                    ParquetRecordBatchReader::new(array_reader, plan).with_memory(admission);
                 NextState::result(
                     RowGroupDecoderState::Finished,
                     RowGroupBuildResult::Data {
@@ -814,6 +876,31 @@ impl RowGroupReaderBuilder {
             }
         };
         Ok(result)
+    }
+
+    fn admission(
+        &self,
+        row_group: usize,
+        projection: &ProjectionMask,
+        selection: Option<&RowSelection>,
+        scope: Option<Arc<dyn crate::arrow::memory::Allocation>>,
+        predicate: bool,
+    ) -> Option<crate::arrow::memory::BatchState> {
+        let memory = self.memory.clone()?;
+        let scope = scope?;
+        Some(crate::arrow::memory::BatchState::new(
+            crate::arrow::memory::Context {
+                memory,
+                metadata: self.metadata.clone(),
+                schema: self.schema.clone(),
+                projection: projection.clone(),
+                row_group,
+                predicate,
+                _scope: scope,
+            },
+            selection,
+            self.metadata.row_group(row_group).num_rows() as usize,
+        ))
     }
 
     /// Which columns should be cached?
@@ -938,7 +1025,9 @@ mod tests {
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
-        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 240);
+        // Keep the state, including its optional scoped allocation, within
+        // four cache lines rather than pinning an incidental exact layout.
+        assert!(std::mem::size_of::<RowGroupDecoderState>() <= 256);
     }
 
     #[test]

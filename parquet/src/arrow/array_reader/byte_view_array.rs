@@ -99,6 +99,10 @@ impl ByteViewArrayReader {
 }
 
 impl ArrayReader for ByteViewArrayReader {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.record_reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -145,14 +149,23 @@ struct ByteViewArrayColumnValueDecoder {
     dict: Option<ViewBuffer>,
     decoder: Option<ByteViewArrayDecoder>,
     validate_utf8: bool,
+    page_memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
 }
 
 impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
     type Buffer = ViewBuffer;
 
+    fn set_page_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        self.page_memory = memory;
+    }
+
     fn new(desc: &ColumnDescPtr) -> Self {
         let validate_utf8 = desc.converted_type() == ConvertedType::UTF8;
         Self {
+            page_memory: None,
             dict: None,
             decoder: None,
             validate_utf8,
@@ -192,13 +205,10 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
         num_levels: usize,
         num_values: Option<usize>,
     ) -> Result<()> {
-        self.decoder = Some(ByteViewArrayDecoder::new(
-            encoding,
-            data,
-            num_levels,
-            num_values,
-            self.validate_utf8,
-        )?);
+        let mut decoder =
+            ByteViewArrayDecoder::new(encoding, data, num_levels, num_values, self.validate_utf8)?;
+        decoder.set_page_memory(self.page_memory.clone());
+        self.decoder = Some(decoder);
         Ok(())
     }
 
@@ -230,6 +240,15 @@ pub enum ByteViewArrayDecoder {
 }
 
 impl ByteViewArrayDecoder {
+    pub(crate) fn set_page_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        if let Self::DeltaByteArray(decoder) = self {
+            decoder.decoder.set_memory(memory);
+        }
+    }
+
     pub fn new(
         encoding: Encoding,
         data: Bytes,
@@ -250,10 +269,10 @@ impl ByteViewArrayDecoder {
                 )?)
             }
             Encoding::DELTA_LENGTH_BYTE_ARRAY => ByteViewArrayDecoder::DeltaLength(
-                ByteViewArrayDecoderDeltaLength::new(data, validate_utf8)?,
+                ByteViewArrayDecoderDeltaLength::new(data, validate_utf8, num_levels)?,
             ),
             Encoding::DELTA_BYTE_ARRAY => ByteViewArrayDecoder::DeltaByteArray(
-                ByteViewArrayDecoderDelta::new(data, validate_utf8)?,
+                ByteViewArrayDecoderDelta::new(data, validate_utf8, num_levels)?,
             ),
             _ => {
                 return Err(general_err!(
@@ -346,7 +365,7 @@ impl ByteViewArrayDecoderPlain {
             if output.buffers.last().is_some_and(|x| x.ptr_eq(&self.buf)) {
                 output.buffers.len() as u32 - 1
             } else {
-                output.append_block(self.buf.clone())
+                output.try_append_block(self.buf.clone())?
             }
         };
 
@@ -357,7 +376,7 @@ impl ByteViewArrayDecoderPlain {
         let mut end_offset = self.offset;
         let mut utf8_validation_begin = end_offset;
 
-        output.views.reserve(to_read);
+        output.reserve_views(to_read);
 
         // Safety: we reserved enough space in output.views
         // and we will only write up to to_read views / track how many views we wrote.
@@ -502,7 +521,7 @@ impl ByteViewArrayDecoderDictionary {
 
         if need_to_create_new_buffer {
             for b in dict.buffers.iter() {
-                output.buffers.push(b.clone());
+                output.try_append_block(b.clone())?;
             }
         }
 
@@ -512,7 +531,7 @@ impl ByteViewArrayDecoderDictionary {
         let base_buffer_idx = output.buffers.len() as u32 - dict.buffers.len() as u32;
 
         // Pre-reserve output capacity to avoid per-chunk reallocation in extend
-        output.views.reserve(len);
+        output.reserve_views(len);
 
         let mut error = None;
         let read = self.decoder.read(len, |keys| {
@@ -578,10 +597,13 @@ pub struct ByteViewArrayDecoderDeltaLength {
 }
 
 impl ByteViewArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: bool, limit: usize) -> Result<Self> {
         let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
         len_decoder.set_data(data.clone(), 0)?;
         let values = len_decoder.values_left();
+        if values > limit {
+            return Err(general_err!("Delta length count exceeds page values"));
+        }
 
         let mut lengths = vec![0; values];
         len_decoder.get(&mut lengths)?;
@@ -614,13 +636,13 @@ impl ByteViewArrayDecoderDeltaLength {
 
     fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
         let to_read = len.min(self.lengths.len() - self.length_offset);
-        output.views.reserve(to_read);
+        output.reserve_views(to_read);
 
         let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_read];
 
         // Zero copy convert `bytes::Bytes` into `arrow_buffer::Buffer`
         let bytes = Buffer::from(self.data.clone());
-        let block_id = output.append_block(bytes);
+        let block_id = output.try_append_block(bytes)?;
 
         let mut current_offset = self.data_offset;
         let initial_offset = current_offset;
@@ -669,9 +691,9 @@ pub struct ByteViewArrayDecoderDelta {
 }
 
 impl ByteViewArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: bool, limit: usize) -> Result<Self> {
         Ok(Self {
-            decoder: DeltaByteArrayDecoder::new(data)?,
+            decoder: DeltaByteArrayDecoder::new_with_limit(data, limit)?,
             validate_utf8,
         })
     }
@@ -686,10 +708,14 @@ impl ByteViewArrayDecoderDelta {
 
     fn read(&mut self, output: &mut ViewBuffer, len: usize) -> Result<usize> {
         let to_reserve = len.min(self.decoder.remaining());
-        output.views.reserve(to_reserve);
+        output.reserve_views(to_reserve);
 
         // array buffer only have long strings
-        let mut array_buffer: Vec<u8> = Vec::with_capacity(4096);
+        let mut array_buffer: Vec<u8> = if output.memory.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(4096)
+        };
 
         let buffer_id = output.buffers.len() as u32;
 
@@ -705,6 +731,14 @@ impl ByteViewArrayDecoderDelta {
                 let view = make_view(bytes, buffer_id, offset as u32);
                 if bytes.len() > 12 {
                     // only copy the data to buffer if the string can not be inlined.
+                    crate::arrow::memory::reserve(
+                        &mut array_buffer,
+                        bytes.len(),
+                        output
+                            .memory
+                            .as_deref()
+                            .map(|value| value as &dyn crate::arrow::memory::Allocation),
+                    )?;
                     array_buffer.extend_from_slice(bytes);
                 }
 
@@ -720,15 +754,35 @@ impl ByteViewArrayDecoderDelta {
             // utf8 validation buffer has only short strings. These short
             // strings are inlined into the views but we copy them into a
             // contiguous buffer to accelerate validation.
-            let mut utf8_validation_buffer = Vec::with_capacity(4096);
+            let mut utf8_validation_buffer = if output.memory.is_some() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(4096)
+            };
 
             let v = self.decoder.read(len, |bytes| {
                 let offset = array_buffer.len();
                 let view = make_view(bytes, buffer_id, offset as u32);
                 if bytes.len() > 12 {
                     // only copy the data to buffer if the string can not be inlined.
+                    crate::arrow::memory::reserve(
+                        &mut array_buffer,
+                        bytes.len(),
+                        output
+                            .memory
+                            .as_deref()
+                            .map(|value| value as &dyn crate::arrow::memory::Allocation),
+                    )?;
                     array_buffer.extend_from_slice(bytes);
                 } else {
+                    crate::arrow::memory::reserve(
+                        &mut utf8_validation_buffer,
+                        bytes.len(),
+                        output
+                            .memory
+                            .as_deref()
+                            .map(|value| value as &dyn crate::arrow::memory::Allocation),
+                    )?;
                     utf8_validation_buffer.extend_from_slice(bytes);
                 }
 
@@ -750,7 +804,7 @@ impl ByteViewArrayDecoderDelta {
             output.views.set_len(initial_len + read);
         }
 
-        let actual_block_id = output.append_block(Buffer::from_vec(array_buffer));
+        let actual_block_id = output.try_append_block(Buffer::from_vec(array_buffer))?;
         assert_eq!(actual_block_id, buffer_id);
         Ok(read)
     }

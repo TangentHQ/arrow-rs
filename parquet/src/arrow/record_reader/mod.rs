@@ -53,6 +53,7 @@ pub struct GenericRecordReader<V, CV> {
     /// Values buffer, lazily initialized on first read to avoid
     /// allocating a buffer that may never be used (e.g., after the last batch)
     values: Option<V>,
+    memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>,
     def_levels: Option<DefinitionLevelBuffer>,
     rep_levels: Option<Vec<i16>>,
     column_reader: Option<ColumnReader<CV>>,
@@ -103,6 +104,7 @@ where
         let rep_levels = (desc.max_rep_level() > 0).then(Vec::new);
 
         Self {
+            memory: None,
             values: None, // Lazily initialized on first read
             def_levels,
             rep_levels,
@@ -114,6 +116,16 @@ where
             values_written: 0,
             padding_threshold: None,
             compact_bitmap: None,
+        }
+    }
+
+    pub(crate) fn set_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>,
+    ) {
+        self.memory = memory.clone();
+        if let Some(values) = self.values.as_mut() {
+            values.set_memory(memory);
         }
     }
 
@@ -290,7 +302,11 @@ where
         let mut physical_values_to_read = 0usize;
         let mut output_slots_to_read = 0usize;
 
-        let values = self.values.get_or_insert_with(|| V::with_capacity(0));
+        let values = self.values.get_or_insert_with(|| {
+            let mut values = V::with_capacity(0);
+            values.set_memory(self.memory.clone());
+            values
+        });
         let compact_bitmap = &mut self.compact_bitmap;
 
         if padding_threshold.is_none() {

@@ -23,6 +23,13 @@ pub trait ValuesBuffer {
     /// Create a new buffer with capacity for at least `capacity` logical values
     fn with_capacity(capacity: usize) -> Self;
 
+    /// Attach the current selected-batch owner to variable buffers.
+    fn set_memory(
+        &mut self,
+        _memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>,
+    ) {
+    }
+
     /// Reserve capacity for `additional` more logical values.
     ///
     /// Callers should use this once the level decoders have determined how

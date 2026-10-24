@@ -155,6 +155,10 @@ where
     K: FromBitpacked + Ord + ArrowNativeType,
     V: OffsetSizeTrait,
 {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.record_reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -230,6 +234,7 @@ struct DictionaryDecoder<K, V> {
     value_type: ArrowType,
 
     phantom: PhantomData<(K, V)>,
+    page_memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
 }
 
 impl<K, V> ColumnValueDecoder for DictionaryDecoder<K, V>
@@ -238,6 +243,12 @@ where
     V: OffsetSizeTrait,
 {
     type Buffer = DictionaryBuffer<K, V>;
+    fn set_page_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        self.page_memory = memory;
+    }
 
     fn new(col: &ColumnDescPtr) -> Self {
         let validate_utf8 = col.converted_type() == ConvertedType::UTF8;
@@ -250,6 +261,7 @@ where
         };
 
         Self {
+            page_memory: None,
             dict: None,
             decoder: None,
             validate_utf8,
@@ -282,9 +294,15 @@ where
         let len = num_values as usize;
         let mut buffer = OffsetBuffer::<V>::with_capacity(0);
         let mut decoder = ByteArrayDecoderPlain::new(buf, len, Some(len), self.validate_utf8);
+        buffer.memory = self.page_memory.clone();
         decoder.read(&mut buffer, usize::MAX)?;
 
         let array = buffer.into_array(None, self.value_type.clone());
+        let array = if let Some(memory) = &self.page_memory {
+            crate::arrow::memory::retain_array(array, memory.clone())?
+        } else {
+            array
+        };
         self.dict = Some(array);
         Ok(())
     }
@@ -341,6 +359,7 @@ where
                     return Ok(0); // All data must be NULL
                 }
 
+                let governed = out.governed();
                 match out.as_keys(dict) {
                     Some(keys) => {
                         // Happy path - can just copy keys
@@ -348,6 +367,9 @@ where
 
                         // TODO: Push vec into decoder (#5177)
                         let start = keys.len();
+                        if governed {
+                            keys.reserve_exact(len);
+                        }
                         keys.resize(start + len, K::default());
                         let len = decoder.get_batch(&mut keys[start..])?;
                         keys.truncate(start + len);

@@ -96,6 +96,7 @@ impl DataRequest {
         // temporary structure used to tell the ArrowReaders what pages are
         // needed for decoding
         let mut in_memory_row_group = InMemoryRowGroup {
+            memory: None,
             row_count,
             column_chunks,
             offset_index: get_offset_index(parquet_metadata, row_group_idx),
@@ -200,6 +201,7 @@ impl<'a> DataRequestBuilder<'a> {
         // temporary structure used to tell the ArrowReaders what pages are
         // needed for decoding
         let row_group = InMemoryRowGroup {
+            memory: None,
             row_count,
             column_chunks,
             offset_index: get_offset_index(parquet_metadata, row_group_idx),

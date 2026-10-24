@@ -37,13 +37,13 @@ ring = { version = "0.17", default-features = false, features = ["wasm32_unknown
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
 
 [dependencies]
-arrow-array = { workspace = true, optional = true }
-arrow-buffer = { workspace = true, optional = true }
-arrow-csv = { workspace = true, optional = true }
-arrow-data = { workspace = true, optional = true }
-arrow-schema = { workspace = true, optional = true }
-arrow-select = { workspace = true, optional = true }
-arrow-ipc = { workspace = true, optional = true }
+arrow-array = { version = "=59.3.0", optional = true }
+arrow-buffer = { version = "=59.3.0", optional = true }
+arrow-csv = { version = "=59.3.0", optional = true }
+arrow-data = { version = "=59.3.0", optional = true }
+arrow-schema = { version = "=59.3.0", optional = true }
+arrow-select = { version = "=59.3.0", optional = true }
+arrow-ipc = { version = "=59.3.0", optional = true }
 parquet-geospatial = { workspace = true, optional = true }
 parquet-variant = { workspace = true, optional = true }
 parquet-variant-json = { workspace = true, optional = true }
@@ -87,8 +87,8 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame"] }
 zstd = { version = "0.13", default-features = false }
 serde_json = { version = "1.0", features = ["std"], default-features = false }
-arrow = { workspace = true, features = ["ipc", "test_utils", "prettyprint", "json"] }
-arrow-cast = { workspace = true }
+arrow = { version = "=59.3.0", default-features = false, features = ["ipc", "test_utils", "prettyprint", "json"] }
+arrow-cast = { version = "=59.3.0" }
 tokio = { version = "1.0", default-features = false, features = ["macros", "rt-multi-thread", "io-util", "fs", "sync"] }
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 object_store = { workspace = true, features = ["azure", "fs"] }

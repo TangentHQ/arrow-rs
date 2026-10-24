@@ -87,6 +87,14 @@ pub trait DefinitionLevelDecoder: ColumnLevelDecoder {
 
 /// Decodes value data
 pub trait ColumnValueDecoder {
+    /// Supply the admitted current page before constructing value decoders.
+    #[cfg(feature = "arrow")]
+    fn set_page_memory(
+        &mut self,
+        _memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+    }
+
     type Buffer;
 
     /// Create a new [`ColumnValueDecoder`]

@@ -108,6 +108,10 @@ impl<I: OffsetSizeTrait> ByteArrayReader<I> {
 }
 
 impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.record_reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -183,14 +187,23 @@ struct ByteArrayColumnValueDecoder<I: OffsetSizeTrait> {
     dict: Option<OffsetBuffer<I>>,
     decoder: Option<ByteArrayDecoder>,
     validate_utf8: bool,
+    page_memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
 }
 
 impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
     type Buffer = OffsetBuffer<I>;
 
+    fn set_page_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        self.page_memory = memory;
+    }
+
     fn new(desc: &ColumnDescPtr) -> Self {
         let validate_utf8 = desc.converted_type() == ConvertedType::UTF8;
         Self {
+            page_memory: None,
             dict: None,
             decoder: None,
             validate_utf8,
@@ -221,6 +234,7 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
             Some(num_values as usize),
             self.validate_utf8,
         );
+        buffer.memory = self.page_memory.clone();
         decoder.read(&mut buffer, usize::MAX)?;
         self.dict = Some(buffer);
         Ok(())
@@ -233,13 +247,10 @@ impl<I: OffsetSizeTrait> ColumnValueDecoder for ByteArrayColumnValueDecoder<I> {
         num_levels: usize,
         num_values: Option<usize>,
     ) -> Result<()> {
-        self.decoder = Some(ByteArrayDecoder::new(
-            encoding,
-            data,
-            num_levels,
-            num_values,
-            self.validate_utf8,
-        )?);
+        let mut decoder =
+            ByteArrayDecoder::new(encoding, data, num_levels, num_values, self.validate_utf8)?;
+        decoder.set_page_memory(self.page_memory.clone());
+        self.decoder = Some(decoder);
         Ok(())
     }
 
@@ -271,6 +282,15 @@ pub enum ByteArrayDecoder {
 }
 
 impl ByteArrayDecoder {
+    pub(crate) fn set_page_memory(
+        &mut self,
+        memory: Option<std::sync::Arc<dyn crate::arrow::memory::Allocation>>,
+    ) {
+        if let Self::DeltaByteArray(decoder) = self {
+            decoder.decoder.set_memory(memory);
+        }
+    }
+
     pub fn new(
         encoding: Encoding,
         data: Bytes,
@@ -289,11 +309,11 @@ impl ByteArrayDecoder {
                 ByteArrayDecoderDictionary::new(data, num_levels, num_values)?,
             ),
             Encoding::DELTA_LENGTH_BYTE_ARRAY => ByteArrayDecoder::DeltaLength(
-                ByteArrayDecoderDeltaLength::new(data, validate_utf8)?,
+                ByteArrayDecoderDeltaLength::new(data, validate_utf8, num_levels)?,
             ),
-            Encoding::DELTA_BYTE_ARRAY => {
-                ByteArrayDecoder::DeltaByteArray(ByteArrayDecoderDelta::new(data, validate_utf8)?)
-            }
+            Encoding::DELTA_BYTE_ARRAY => ByteArrayDecoder::DeltaByteArray(
+                ByteArrayDecoderDelta::new(data, validate_utf8, num_levels)?,
+            ),
             _ => {
                 return Err(general_err!(
                     "unsupported encoding for byte array: {}",
@@ -379,7 +399,7 @@ impl ByteArrayDecoderPlain {
         let initial_values_length = output.values.len();
 
         let to_read = len.min(self.max_remaining_values);
-        output.offsets.reserve(to_read);
+        output.reserve_offsets(to_read);
 
         let remaining_bytes = self.buf.len() - self.offset;
         if remaining_bytes == 0 {
@@ -391,7 +411,9 @@ impl ByteArrayDecoderPlain {
             .map(|x| x / self.max_remaining_values)
             .unwrap_or_default();
 
-        output.values.reserve(estimated_bytes);
+        if !output.governed() {
+            output.values.reserve(estimated_bytes);
+        }
 
         let mut read = 0;
 
@@ -451,10 +473,13 @@ pub struct ByteArrayDecoderDeltaLength {
 }
 
 impl ByteArrayDecoderDeltaLength {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: bool, limit: usize) -> Result<Self> {
         let mut len_decoder = DeltaBitPackDecoder::<Int32Type>::new();
         len_decoder.set_data(data.clone(), 0)?;
         let values = len_decoder.values_left();
+        if values > limit {
+            return Err(general_err!("Delta length count exceeds page values"));
+        }
 
         let mut lengths = vec![0; values];
         len_decoder.get(&mut lengths)?;
@@ -497,8 +522,8 @@ impl ByteArrayDecoderDeltaLength {
         let total_bytes: usize = src_lengths.iter().map(|x| *x as usize).sum();
 
         // Reserve capacity for both offsets and values upfront
-        output.offsets.reserve(to_read);
-        output.values.reserve(total_bytes);
+        output.reserve_offsets(to_read);
+        output.reserve_values(total_bytes)?;
 
         // Delta length data is contiguous — copy all value bytes at once
         let data_end = self.data_offset + total_bytes;
@@ -543,9 +568,9 @@ pub struct ByteArrayDecoderDelta {
 }
 
 impl ByteArrayDecoderDelta {
-    fn new(data: Bytes, validate_utf8: bool) -> Result<Self> {
+    fn new(data: Bytes, validate_utf8: bool, limit: usize) -> Result<Self> {
         Ok(Self {
-            decoder: DeltaByteArrayDecoder::new(data)?,
+            decoder: DeltaByteArrayDecoder::new_with_limit(data, limit)?,
             validate_utf8,
         })
     }
@@ -556,7 +581,7 @@ impl ByteArrayDecoderDelta {
         len: usize,
     ) -> Result<usize> {
         let initial_values_length = output.values.len();
-        output.offsets.reserve(len.min(self.decoder.remaining()));
+        output.reserve_offsets(len.min(self.decoder.remaining()));
 
         let read = self
             .decoder
@@ -597,7 +622,7 @@ impl ByteArrayDecoderDictionary {
         }
 
         // Pre-reserve offsets capacity to avoid per-chunk reallocation
-        output.offsets.reserve(len);
+        output.reserve_offsets(len);
 
         self.decoder.read(len, |keys| {
             output.extend_from_dictionary(keys, dict.offsets.as_slice(), dict.values.as_slice())

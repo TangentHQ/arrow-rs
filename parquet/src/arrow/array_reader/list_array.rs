@@ -80,6 +80,10 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayReader<OffsetSize> {
 
 /// Implementation of ListArrayReader.
 impl<OffsetSize: OffsetSizeTrait> ArrayReader for ListArrayReader<OffsetSize> {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.item_reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

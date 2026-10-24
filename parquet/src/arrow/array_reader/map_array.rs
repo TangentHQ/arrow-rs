@@ -84,6 +84,10 @@ impl MapArrayReader {
 }
 
 impl ArrayReader for MapArrayReader {
+    fn set_memory(&mut self, memory: Option<std::sync::Arc<dyn crate::arrow::memory::BatchOwner>>) {
+        self.reader.set_memory(memory);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -190,6 +190,7 @@ pub mod async_reader;
 #[cfg(feature = "async")]
 pub mod async_writer;
 
+pub mod memory;
 pub mod push_decoder;
 
 mod in_memory_row_group;

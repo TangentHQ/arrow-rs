@@ -521,6 +521,101 @@ pub(crate) fn decode_page(
     Ok(result)
 }
 
+#[cfg(feature = "arrow")]
+fn admit_page(
+    header: &PageHeader,
+    physical_type: Type,
+    compressed: bool,
+    memory: Option<&(Arc<dyn crate::arrow::memory::DecoderMemory>, usize, usize)>,
+    remaining_values: &mut i64,
+) -> Result<Option<crate::arrow::memory::PageReservation>> {
+    let Some((memory, row_group, column)) = memory else {
+        return Ok(None);
+    };
+    let (encoding, values, dictionary, compressed) = match header.r#type {
+        PageType::DICTIONARY_PAGE => {
+            let data = header
+                .dictionary_page_header
+                .as_ref()
+                .ok_or_else(|| general_err!("Missing dictionary header"))?;
+            (data.encoding, data.num_values, true, compressed)
+        }
+        PageType::DATA_PAGE => {
+            let data = header
+                .data_page_header
+                .as_ref()
+                .ok_or_else(|| general_err!("Missing data header"))?;
+            (data.encoding, data.num_values, false, compressed)
+        }
+        PageType::DATA_PAGE_V2 => {
+            let data = header
+                .data_page_header_v2
+                .as_ref()
+                .ok_or_else(|| general_err!("Missing data header"))?;
+            (
+                data.encoding,
+                data.num_values,
+                false,
+                compressed && data.is_compressed.unwrap_or(true),
+            )
+        }
+        _ => return Err(general_err!("Unsupported page type")),
+    };
+    if !dictionary {
+        if values < 0 || i64::from(values) > *remaining_values {
+            return Err(general_err!("Data page values exceed column metadata"));
+        }
+        *remaining_values -= i64::from(values);
+    }
+    memory
+        .page(&crate::arrow::memory::PageMemory {
+            row_group: *row_group,
+            column: *column,
+            physical_type,
+            encoding,
+            uncompressed_bytes: header.uncompressed_page_size.try_into()?,
+            num_values: values.try_into()?,
+            dictionary,
+            compressed,
+        })
+        .map(Some)
+}
+#[cfg(feature = "arrow")]
+fn retain_page(
+    mut page: Page,
+    admission: Option<crate::arrow::memory::PageReservation>,
+    current: &mut Option<Arc<dyn crate::arrow::memory::Allocation>>,
+    dictionary: &mut Option<Arc<dyn crate::arrow::memory::Allocation>>,
+) -> Page {
+    let Some(admission) = admission else {
+        return page;
+    };
+    let memory = admission.scratch;
+    if page.is_dictionary_page() {
+        *dictionary = Some(memory.clone());
+    }
+    *current = Some(memory.clone());
+    struct Owned {
+        bytes: Bytes,
+        _memory: Arc<dyn crate::arrow::memory::Allocation>,
+    }
+    impl AsRef<[u8]> for Owned {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    let buffer = match &mut page {
+        Page::DataPage { buf, .. }
+        | Page::DataPageV2 { buf, .. }
+        | Page::DictionaryPage { buf, .. } => buf,
+    };
+    *buffer = Bytes::from_owner(Owned {
+        bytes: buffer.clone(),
+        _memory: admission.backing,
+    });
+    page
+}
+
 enum SerializedPageReaderState {
     Values {
         /// The current byte offset in the reader
@@ -575,6 +670,14 @@ pub struct SerializedPageReader<R: ChunkReader> {
     state: SerializedPageReaderState,
 
     context: SerializedPageReaderContext,
+    #[cfg(feature = "arrow")]
+    memory: Option<(Arc<dyn crate::arrow::memory::DecoderMemory>, usize, usize)>,
+    #[cfg(feature = "arrow")]
+    current_memory: Option<Arc<dyn crate::arrow::memory::Allocation>>,
+    #[cfg(feature = "arrow")]
+    dictionary_memory: Option<Arc<dyn crate::arrow::memory::Allocation>>,
+    #[cfg(feature = "arrow")]
+    remaining_values: i64,
 }
 
 impl<R: ChunkReader> SerializedPageReader<R> {
@@ -677,7 +780,26 @@ impl<R: ChunkReader> SerializedPageReader<R> {
             state,
             physical_type: meta.column_type(),
             context,
+            #[cfg(feature = "arrow")]
+            memory: None,
+            #[cfg(feature = "arrow")]
+            current_memory: None,
+            #[cfg(feature = "arrow")]
+            dictionary_memory: None,
+            #[cfg(feature = "arrow")]
+            remaining_values: meta.num_values(),
         })
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn with_decoder_memory(
+        mut self,
+        memory: Option<Arc<dyn crate::arrow::memory::DecoderMemory>>,
+        group: usize,
+        column: usize,
+    ) -> Self {
+        self.memory = memory.map(|memory| (memory, group, column));
+        self
     }
 
     /// Similar to `peek_next_page`, but returns the offset of the next page instead of the page metadata.
@@ -912,6 +1034,11 @@ fn verify_page_size(
 }
 
 impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
+    #[cfg(feature = "arrow")]
+    fn memory(&self) -> Option<Arc<dyn crate::arrow::memory::Allocation>> {
+        self.current_memory.clone()
+    }
+
     fn get_next_page(&mut self) -> Result<Option<Page>> {
         loop {
             let page = match &mut self.state {
@@ -961,12 +1088,27 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                         self.context
                             .decrypt_page_data(buffer, *page_index, *require_dictionary)?;
 
+                    #[cfg(feature = "arrow")]
+                    let admission = admit_page(
+                        &header,
+                        self.physical_type,
+                        self.decompressor.is_some(),
+                        self.memory.as_ref(),
+                        &mut self.remaining_values,
+                    )?;
                     let page = decode_page(
                         header,
                         buffer,
                         self.physical_type,
                         self.decompressor.as_mut(),
                     )?;
+                    #[cfg(feature = "arrow")]
+                    let page = retain_page(
+                        page,
+                        admission,
+                        &mut self.current_memory,
+                        &mut self.dictionary_memory,
+                    );
                     if page.is_data_page() {
                         *page_index += 1;
                     } else if page.is_dictionary_page() {
@@ -1005,12 +1147,28 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     if !is_dictionary_page {
                         *page_index += 1;
                     }
-                    decode_page(
+                    #[cfg(feature = "arrow")]
+                    let admission = admit_page(
+                        &header,
+                        self.physical_type,
+                        self.decompressor.is_some(),
+                        self.memory.as_ref(),
+                        &mut self.remaining_values,
+                    )?;
+                    let page = decode_page(
                         header,
                         bytes,
                         self.physical_type,
                         self.decompressor.as_mut(),
-                    )?
+                    )?;
+                    #[cfg(feature = "arrow")]
+                    let page = retain_page(
+                        page,
+                        admission,
+                        &mut self.current_memory,
+                        &mut self.dictionary_memory,
+                    );
+                    page
                 }
             };
 
