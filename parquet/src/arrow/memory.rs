@@ -73,6 +73,8 @@ pub struct RowGroupMemory<'a> {
     pub row_group: usize,
     /// Whether predicates will be evaluated.
     pub predicates: bool,
+    /// Exact incoming selection entries, before native reader copies.
+    pub selectors: usize,
 }
 /// A validated page about to be decompressed and decoded.
 #[derive(Debug)]
@@ -728,6 +730,59 @@ mod tests {
         }
     }
 
+    // Incoming page selections allocate native cursor copies even without a
+    // RowFilter. Refusal must precede those copies and all batch/page decoding.
+    #[test]
+    fn incoming_selectors_are_admitted_without_predicates() {
+        #[derive(Debug)]
+        struct Selection {
+            pool: Arc<Pool>,
+            count: AtomicUsize,
+        }
+        impl DecoderMemory for Selection {
+            fn row_group(&self, request: &RowGroupMemory<'_>) -> Result<Arc<dyn Allocation>> {
+                assert!(!request.predicates);
+                self.count.store(request.selectors, Ordering::SeqCst);
+                Ok(Arc::new(self.pool.lease(
+                    request.selectors * std::mem::size_of::<RowSelector>() * 2,
+                )?))
+            }
+            fn page(&self, _: &PageMemory) -> Result<PageReservation> {
+                panic!("selection refusal must precede page decode")
+            }
+            fn batch(&self, _: &BatchMemory<'_>) -> Result<BatchReservation> {
+                panic!("selection refusal must precede batch construction")
+            }
+        }
+        let (bytes, _) = file(Encoding::PLAIN, false, 4096, 0);
+        let metadata = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .unwrap()
+            .metadata()
+            .clone();
+        for count in [1, 17, 129, 1025] {
+            let selectors = (0..count)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>();
+            let requested = selectors.len() * std::mem::size_of::<RowSelector>() * 2;
+            let pool = Pool::new(requested - 1);
+            let memory = Arc::new(Selection {
+                pool: pool.clone(),
+                count: AtomicUsize::new(0),
+            });
+            let mut decoder = ParquetPushDecoderBuilder::try_new_decoder(metadata.clone())
+                .unwrap()
+                .with_row_selection(RowSelection::from(selectors))
+                .with_decoder_memory(memory.clone())
+                .build()
+                .unwrap();
+            let error = decoder.try_decode().unwrap_err();
+            assert!(error.to_string().contains("governed memory refused"));
+            assert_eq!(memory.count.load(Ordering::SeqCst), count * 2);
+            drop(decoder);
+            assert_eq!(pool.used.load(Ordering::SeqCst), 0);
+        }
+    }
+
     #[test]
     fn native_refuses_oversized_pages_and_releases_on_cancel() {
         let (bytes, _) = file(Encoding::PLAIN, false, 2, 1024 * 1024);
@@ -856,6 +911,60 @@ mod tests {
         assert!(next_reader(&mut decoder, &bytes).is_err());
         drop(decoder);
         assert_eq!(pool.used.load(Ordering::SeqCst), 0);
+    }
+
+    // Parquet null fixed-list entries carry definition levels, not every padded
+    // Arrow child slot. Admission must multiply the physical entry count by
+    // fixed-size multiplicity even beneath a repeated outer list.
+    #[test]
+    fn repeated_null_fixed_lists_expand_physical_level_counts() {
+        use arrow_array::{FixedSizeListArray, ListArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::{DataType, Field};
+        for entries in [1, 17, 129, 1025, 4097] {
+            let field = Arc::new(Field::new("item", DataType::Int64, true));
+            let values = Arc::new(Int64Array::from(vec![0; entries * 8])) as ArrayRef;
+            let inner =
+                FixedSizeListArray::try_new(field, 8, values, Some(NullBuffer::new_null(entries)))
+                    .unwrap();
+            let field = Arc::new(Field::new("item", inner.data_type().clone(), true));
+            let outer = ListArray::try_new(
+                field,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, entries as i32])),
+                Arc::new(inner),
+                None,
+            )
+            .unwrap();
+            let batch =
+                RecordBatch::try_from_iter([("nested", Arc::new(outer) as ArrayRef)]).unwrap();
+            let mut writer = ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            let bytes = bytes::Bytes::from(writer.into_inner().unwrap());
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            let physical = builder.metadata().row_group(0).column(0).num_values() as usize;
+            let decoded = builder.build().unwrap().next().unwrap().unwrap();
+            let outer = decoded
+                .column(0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let inner = outer
+                .values()
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            assert_eq!(decoded.num_rows(), 1);
+            assert_eq!(inner.len(), entries);
+            assert_eq!(inner.null_count(), entries);
+            assert_eq!(physical, entries);
+            assert_eq!(inner.values().len(), physical * 8);
+            assert!(inner.values().get_array_memory_size() >= physical * 8 * 8);
+            println!(
+                "null_fixed_list entries={entries} physical_values={physical} child_slots={} array_bytes={}",
+                inner.values().len(),
+                decoded.get_array_memory_size()
+            );
+        }
     }
     #[test]
     fn native_arrow_dictionary_fallback_retains_shared_values() {

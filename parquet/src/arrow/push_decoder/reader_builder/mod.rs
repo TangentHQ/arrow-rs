@@ -419,10 +419,6 @@ impl RowGroupReaderBuilder {
                 "Internal Error: next_row_group called while still reading a row group. Expected Finished state, got {state:?}"
             )));
         }
-        let plan_builder = ReadPlanBuilder::new(self.batch_size)
-            .with_selection(selection)
-            .with_row_selection_policy(self.row_selection_policy);
-
         let scope = self
             .memory
             .as_ref()
@@ -434,9 +430,15 @@ impl RowGroupReaderBuilder {
                         .filter
                         .as_ref()
                         .is_some_and(|filter| !filter.predicates.is_empty()),
+                    selectors: selection
+                        .as_ref()
+                        .map_or(0, |selection| selection.iter().count()),
                 })
             })
             .transpose()?;
+        let plan_builder = ReadPlanBuilder::new(self.batch_size)
+            .with_selection(selection)
+            .with_row_selection_policy(self.row_selection_policy);
         let row_group_info = RowGroupInfo {
             row_group_idx,
             row_count,
