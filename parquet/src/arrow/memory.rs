@@ -149,9 +149,24 @@ impl BatchMemory<'_> {
         Ok(ranges)
     }
 }
+/// Measured work for governed fixed-cell cache reuse.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CacheObservation {
+    /// Rows decoded from Parquet into cache backing.
+    pub decoded: usize,
+    /// Selected output rows served from cache.
+    pub reused: usize,
+    /// Native inner-reader decoding time.
+    pub decode_nanos: u64,
+    /// Wrapper bookkeeping and selected-array materialization time.
+    pub overhead_nanos: u64,
+}
+
 /// Pre-admitted cache capacity. Retention transfers backing charges to each
 /// immutable array so eviction/EOF cannot release externally retained buffers.
 pub trait CacheOwner: Debug + Send + Sync {
+    /// Record batch-level work without retaining per-batch metadata.
+    fn observe(&self, _observation: CacheObservation) {}
     /// Transfer already-admitted backing capacity to this newly decoded batch.
     fn retain(&self, batch: RecordBatch) -> Result<RecordBatch>;
 }

@@ -95,6 +95,16 @@ impl RowGroupCache {
         self
     }
 
+    pub(crate) fn governed(&self) -> bool {
+        self.memory.is_some()
+    }
+
+    pub(crate) fn observe(&self, observation: crate::arrow::memory::CacheObservation) {
+        if let Some(memory) = &self.memory {
+            memory.observe(observation);
+        }
+    }
+
     pub(crate) fn retain(&self, array: ArrayRef) -> crate::errors::Result<ArrayRef> {
         let Some(memory) = &self.memory else {
             return Ok(array);

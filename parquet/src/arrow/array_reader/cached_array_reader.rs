@@ -20,6 +20,7 @@
 use crate::arrow::array_reader::row_group_cache::BatchID;
 use crate::arrow::array_reader::{ArrayReader, row_group_cache::RowGroupCache};
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::arrow::memory::CacheObservation;
 use crate::errors::Result;
 use arrow_array::{ArrayRef, BooleanArray, new_empty_array};
 use arrow_buffer::BooleanBufferBuilder;
@@ -27,6 +28,7 @@ use arrow_schema::DataType as ArrowType;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 /// Role of the cached array reader
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +87,8 @@ pub struct CachedArrayReader {
     /// Local cache to store batches between read_records and consume_batch calls
     /// This ensures data is available even if the shared cache evicts items
     local_cache: HashMap<BatchID, ArrayRef>,
+    governed: bool,
+    reused: usize,
     /// Statistics to report on the Cache behavior
     metrics: ArrowReaderMetrics,
 }
@@ -99,6 +103,7 @@ impl CachedArrayReader {
         metrics: ArrowReaderMetrics,
     ) -> Self {
         let batch_size = cache.read().unwrap().batch_size();
+        let governed = cache.read().is_ok_and(|cache| cache.governed());
 
         Self {
             inner,
@@ -110,6 +115,8 @@ impl CachedArrayReader {
             selections: BooleanBufferBuilder::new(0),
             role,
             local_cache: HashMap::new(),
+            governed,
+            reused: 0,
             metrics,
         }
     }
@@ -138,6 +145,7 @@ impl CachedArrayReader {
         // For sparse mask reads, this full-batch fallback relies on `MaskCursor`
         // ending every chunk at a selected row. Predicate fetch expands cached
         // columns to batch boundaries, so the batch containing that row is loaded.
+        let started = self.governed.then(Instant::now);
         let read = self.inner.read_records(self.batch_size)?;
 
         // If there are no remaining records (EOF), return immediately without
@@ -148,6 +156,9 @@ impl CachedArrayReader {
         }
 
         let array = self.inner.consume_batch()?;
+        let decoded = started.map_or(0, |started| {
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+        });
         let array = self.shared_cache.read().unwrap().retain(array)?;
 
         // Store in both shared cache and local cache
@@ -164,6 +175,15 @@ impl CachedArrayReader {
         self.local_cache.insert(batch_id, array);
 
         self.inner_position += read;
+        if let Some(started) = started {
+            self.observe(CacheObservation {
+                decoded: read,
+                decode_nanos: decoded,
+                overhead_nanos: (started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .saturating_sub(decoded),
+                ..Default::default()
+            });
+        }
         Ok(read)
     }
 
@@ -189,89 +209,14 @@ impl CachedArrayReader {
     }
 }
 
-impl ArrayReader for CachedArrayReader {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn get_data_type(&self) -> &ArrowType {
-        self.inner.get_data_type()
-    }
-
-    fn read_records(&mut self, num_records: usize) -> Result<usize> {
-        let mut read = 0;
-        while read < num_records {
-            let batch_id = self.get_batch_id_from_position(self.outer_position);
-
-            // Check local cache first
-            let cached = if let Some(array) = self.local_cache.get(&batch_id) {
-                Some(Arc::clone(array))
-            } else {
-                // If not in local cache, i.e., we are consumer, check shared cache
-                let cache_content = self
-                    .shared_cache
-                    .read()
-                    .unwrap()
-                    .get(self.column_idx, batch_id);
-                if let Some(array) = cache_content.as_ref() {
-                    // Store in local cache for later use in consume_batch
-                    self.local_cache.insert(batch_id, Arc::clone(array));
-                }
-                cache_content
-            };
-
-            match cached {
-                Some(array) => {
-                    let array_len = array.len();
-                    if array_len + batch_id.val * self.batch_size > self.outer_position {
-                        // the cache batch has some records that we can select
-                        let v = array_len + batch_id.val * self.batch_size - self.outer_position;
-                        let select_cnt = std::cmp::min(num_records - read, v);
-                        read += select_cnt;
-                        self.metrics.increment_cache_reads(select_cnt);
-                        self.outer_position += select_cnt;
-                        self.selections.append_n(select_cnt, true);
-                    } else {
-                        // this is last batch and we have used all records from it
-                        break;
-                    }
-                }
-                None => {
-                    let read_from_inner = self.fetch_batch(batch_id)?;
-                    // Reached end-of-file, no more records to read
-                    if read_from_inner == 0 {
-                        break;
-                    }
-                    self.metrics.increment_inner_reads(read_from_inner);
-                    let select_from_this_batch = std::cmp::min(
-                        num_records - read,
-                        self.inner_position - self.outer_position,
-                    );
-                    read += select_from_this_batch;
-                    self.outer_position += select_from_this_batch;
-                    self.selections.append_n(select_from_this_batch, true);
-                    if read_from_inner < self.batch_size {
-                        // this is last batch from inner reader
-                        break;
-                    }
-                }
-            }
+impl CachedArrayReader {
+    fn observe(&self, observation: CacheObservation) {
+        if let Ok(cache) = self.shared_cache.read() {
+            cache.observe(observation);
         }
-        Ok(read)
     }
 
-    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
-        let mut skipped = 0;
-        while skipped < num_records {
-            let size = std::cmp::min(num_records - skipped, self.batch_size);
-            skipped += size;
-            self.selections.append_n(size, false);
-            self.outer_position += size;
-        }
-        Ok(num_records)
-    }
-
-    fn consume_batch(&mut self) -> Result<ArrayRef> {
+    fn consume_cached(&mut self) -> Result<ArrayRef> {
         let row_count = self.selections.len();
         if row_count == 0 {
             return Ok(new_empty_array(self.inner.get_data_type()));
@@ -341,6 +286,106 @@ impl ArrayReader for CachedArrayReader {
                     .collect::<Vec<_>>(),
             )?),
         }
+    }
+}
+
+impl ArrayReader for CachedArrayReader {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn get_data_type(&self) -> &ArrowType {
+        self.inner.get_data_type()
+    }
+
+    fn read_records(&mut self, num_records: usize) -> Result<usize> {
+        let mut read = 0;
+        while read < num_records {
+            let batch_id = self.get_batch_id_from_position(self.outer_position);
+
+            // Check local cache first
+            let cached = if let Some(array) = self.local_cache.get(&batch_id) {
+                Some(Arc::clone(array))
+            } else {
+                // If not in local cache, i.e., we are consumer, check shared cache
+                let cache_content = self
+                    .shared_cache
+                    .read()
+                    .unwrap()
+                    .get(self.column_idx, batch_id);
+                if let Some(array) = cache_content.as_ref() {
+                    // Store in local cache for later use in consume_batch
+                    self.local_cache.insert(batch_id, Arc::clone(array));
+                }
+                cache_content
+            };
+
+            match cached {
+                Some(array) => {
+                    let array_len = array.len();
+                    if array_len + batch_id.val * self.batch_size > self.outer_position {
+                        // the cache batch has some records that we can select
+                        let v = array_len + batch_id.val * self.batch_size - self.outer_position;
+                        let select_cnt = std::cmp::min(num_records - read, v);
+                        read += select_cnt;
+                        self.metrics.increment_cache_reads(select_cnt);
+                        if self.role == CacheRole::Consumer {
+                            self.reused = self.reused.saturating_add(select_cnt);
+                        }
+                        self.outer_position += select_cnt;
+                        self.selections.append_n(select_cnt, true);
+                    } else {
+                        // this is last batch and we have used all records from it
+                        break;
+                    }
+                }
+                None => {
+                    let read_from_inner = self.fetch_batch(batch_id)?;
+                    // Reached end-of-file, no more records to read
+                    if read_from_inner == 0 {
+                        break;
+                    }
+                    self.metrics.increment_inner_reads(read_from_inner);
+                    let select_from_this_batch = std::cmp::min(
+                        num_records - read,
+                        self.inner_position - self.outer_position,
+                    );
+                    read += select_from_this_batch;
+                    self.outer_position += select_from_this_batch;
+                    self.selections.append_n(select_from_this_batch, true);
+                    if read_from_inner < self.batch_size {
+                        // this is last batch from inner reader
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(read)
+    }
+
+    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
+        let mut skipped = 0;
+        while skipped < num_records {
+            let size = std::cmp::min(num_records - skipped, self.batch_size);
+            skipped += size;
+            self.selections.append_n(size, false);
+            self.outer_position += size;
+        }
+        Ok(num_records)
+    }
+
+    fn consume_batch(&mut self) -> Result<ArrayRef> {
+        let started = self.governed.then(Instant::now);
+        let result = self.consume_cached();
+        if let Some(started) = started {
+            let reused = std::mem::take(&mut self.reused);
+            self.observe(CacheObservation {
+                reused,
+                overhead_nanos: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                ..Default::default()
+            });
+        }
+        result
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
