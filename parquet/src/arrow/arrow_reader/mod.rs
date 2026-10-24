@@ -1552,17 +1552,21 @@ impl ParquetRecordBatchReader {
         self
     }
 
+    /// Governed selectors know exact exhaustion without decoding another batch.
+    /// Stock readers keep their existing EOF discovery path.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|memory| memory.remaining() == 0)
+    }
+
     /// Returns the next `RecordBatch` from the reader, or `None` if the reader
     /// has reached the end of the file.
     ///
     /// Returns `Result<Option<..>>` rather than `Option<Result<..>>` to
     /// simplify error handling with `?`
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
-        if self
-            .memory
-            .as_ref()
-            .is_some_and(|memory| memory.remaining() == 0)
-        {
+        if self.is_exhausted() {
             return Ok(None);
         }
         let mut read_records = 0;

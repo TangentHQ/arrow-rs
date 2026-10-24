@@ -733,9 +733,19 @@ impl ParquetDecoderState {
                         // Successfully decoded a batch, return it
                         Some(Ok(batch)) => {
                             let result = DecodeResult::Data(batch);
-                            let next_state = Self::DecodingRowGroup {
-                                record_batch_reader,
-                                remaining_row_groups,
+                            let next_state = if record_batch_reader.is_exhausted() {
+                                // Release completed decoder scratch before a
+                                // downstream queue can park the final batch.
+                                // Returned arrays own their retained buffers.
+                                drop(record_batch_reader);
+                                Self::ReadingRowGroup {
+                                    remaining_row_groups,
+                                }
+                            } else {
+                                Self::DecodingRowGroup {
+                                    record_batch_reader,
+                                    remaining_row_groups,
+                                }
                             };
                             return Ok((next_state, result));
                         }

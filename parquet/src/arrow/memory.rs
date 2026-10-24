@@ -669,6 +669,65 @@ mod tests {
             }
         }
     }
+
+    // A downstream queue may retain the final batch without polling again.
+    // Completed native readers must release their real scratch first; only
+    // the projected allocation owners may survive that backpressure boundary.
+    #[test]
+    fn final_queued_batch_releases_reader_scratch_before_another_poll() {
+        for dictionary in [false, true] {
+            for view in [false, true] {
+                let (bytes, values) = file(Encoding::PLAIN, dictionary, 1024, 8192);
+                let pool = Pool::new(4 * 1024 * 1024);
+                let mut decoder = decoder(&bytes, pool.clone(), view, true, false);
+                let batch = loop {
+                    match decoder.try_decode().unwrap() {
+                        DecodeResult::Data(batch) => break batch,
+                        DecodeResult::NeedsData(ranges) => {
+                            let data = ranges
+                                .iter()
+                                .map(|range| bytes.slice(range.start as usize..range.end as usize))
+                                .collect();
+                            decoder.push_ranges(ranges, data).unwrap();
+                        }
+                        DecodeResult::Finished => panic!("selected values disappeared"),
+                    }
+                };
+                let output = batch.column(1).clone();
+                assert_eq!(batch.num_rows(), 2);
+                let actual = if view {
+                    output
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                } else {
+                    output
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(actual, [values[1].clone(), values[1023].clone()]);
+                drop(batch);
+                let queued = pool.used.load(Ordering::SeqCst);
+                assert!(queued > 0, "projected arrays must retain allocation owners");
+                drop(decoder);
+                assert_eq!(
+                    queued,
+                    pool.used.load(Ordering::SeqCst),
+                    "a queued final batch must not retain reader-local scratch"
+                );
+                drop(output);
+                assert_eq!(pool.used.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
     #[test]
     fn native_refuses_oversized_pages_and_releases_on_cancel() {
         let (bytes, _) = file(Encoding::PLAIN, false, 2, 1024 * 1024);
