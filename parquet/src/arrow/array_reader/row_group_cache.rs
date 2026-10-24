@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::DataType;
+use arrow_schema::{Field, Schema};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Starting row ID for this batch
 ///
@@ -70,6 +72,7 @@ pub struct RowGroupCache {
     max_cache_bytes: usize,
     /// Current cache size in bytes
     current_cache_size: usize,
+    memory: Option<Arc<dyn crate::arrow::memory::CacheOwner>>,
 }
 
 impl RowGroupCache {
@@ -80,7 +83,30 @@ impl RowGroupCache {
             batch_size,
             max_cache_bytes,
             current_cache_size: 0,
+            memory: None,
         }
+    }
+
+    pub(crate) fn with_memory(
+        mut self,
+        memory: Option<Arc<dyn crate::arrow::memory::CacheOwner>>,
+    ) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    pub(crate) fn retain(&self, array: ArrayRef) -> crate::errors::Result<ArrayRef> {
+        let Some(memory) = &self.memory else {
+            return Ok(array);
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "cache",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![array])?;
+        let batch = memory.retain(batch)?;
+        Ok(batch.column(0).clone())
     }
 
     /// Inserts an array into the cache for the given column and starting row ID

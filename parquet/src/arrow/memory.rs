@@ -149,8 +149,38 @@ impl BatchMemory<'_> {
         Ok(ranges)
     }
 }
+/// Pre-admitted cache capacity. Retention transfers backing charges to each
+/// immutable array so eviction/EOF cannot release externally retained buffers.
+pub trait CacheOwner: Debug + Send + Sync {
+    /// Transfer already-admitted backing capacity to this newly decoded batch.
+    fn retain(&self, batch: RecordBatch) -> Result<RecordBatch>;
+}
+
+/// Whole-row-group predicate cache admission, before cache readers allocate.
+#[derive(Debug)]
+pub struct CacheMemory<'a> {
+    /// Frozen file metadata.
+    pub metadata: &'a ParquetMetaData,
+    /// Physical row-group index.
+    pub row_group: usize,
+    /// Columns reused by predicates and output.
+    pub projection: &'a ProjectionMask,
+    /// Physical Arrow schema.
+    pub schema: &'a Schema,
+    /// Native cache alignment.
+    pub batch_size: usize,
+    /// Maximum admitted cache bytes.
+    pub limit: usize,
+}
+
 /// Opt-in admission. Stock readers do not construct or call this interface.
 pub trait DecoderMemory: Debug + Send + Sync {
+    /// None declines caching without failing the required decode. The owner
+    /// must cover full cache batches, metadata, and materialization scratch.
+    fn cache(&self, _request: &CacheMemory<'_>) -> Result<Option<Arc<dyn CacheOwner>>> {
+        Ok(None)
+    }
+
     /// Admit native predicate masks/selection metadata through row-group EOF.
     fn row_group(&self, request: &RowGroupMemory<'_>) -> Result<Arc<dyn Allocation>>;
     /// Admit decompressed backing, dictionary cells, and native page scratch.

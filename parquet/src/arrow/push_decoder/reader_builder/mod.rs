@@ -523,15 +523,33 @@ impl RowGroupReaderBuilder {
                 };
 
                 // we have predicates to evaluate
-                let cache_projection =
+                let mut cache_projection =
                     self.compute_cache_projection(row_group_info.row_group_idx, &filter);
+                let owner = if let Some(memory) = &self.memory {
+                    let owner = memory.cache(&crate::arrow::memory::CacheMemory {
+                        metadata: &self.metadata,
+                        row_group: row_group_info.row_group_idx,
+                        projection: &cache_projection,
+                        schema: &self.schema,
+                        batch_size: self.batch_size,
+                        limit: self.max_predicate_cache_size,
+                    })?;
+                    if owner.is_none() {
+                        cache_projection = ProjectionMask::none(
+                            self.metadata.file_metadata().schema_descr().num_columns(),
+                        );
+                    }
+                    owner
+                } else {
+                    None
+                };
 
                 let cache_info = CacheInfo::new(
                     cache_projection,
-                    Arc::new(RwLock::new(RowGroupCache::new(
-                        self.batch_size,
-                        self.max_predicate_cache_size,
-                    ))),
+                    Arc::new(RwLock::new(
+                        RowGroupCache::new(self.batch_size, self.max_predicate_cache_size)
+                            .with_memory(owner),
+                    )),
                 );
 
                 let filter_info = FilterInfo::new(filter, cache_info);
@@ -545,8 +563,30 @@ impl RowGroupReaderBuilder {
             RowGroupDecoderState::Filters {
                 row_group_info,
                 column_chunks,
-                filter_info,
+                mut filter_info,
             } => {
+                if !filter_info
+                    .current_mut()
+                    .should_evaluate(row_group_info.row_count)
+                {
+                    return Ok(match filter_info.advance() {
+                        AdvanceResult::Continue(filter_info) => {
+                            NextState::again(RowGroupDecoderState::Filters {
+                                row_group_info,
+                                column_chunks,
+                                filter_info,
+                            })
+                        }
+                        AdvanceResult::Done(filter, cache_info) => {
+                            self.filter = Some(filter);
+                            NextState::again(RowGroupDecoderState::StartData {
+                                row_group_info,
+                                column_chunks,
+                                cache_info: Some(cache_info),
+                            })
+                        }
+                    });
+                }
                 let RowGroupInfo {
                     row_group_idx,
                     row_count,

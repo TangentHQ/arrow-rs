@@ -254,14 +254,13 @@ impl ParquetPushDecoderBuilder {
     }
 
     /// Install fallible native decoding admission. Governed readers use exact
-    /// selectors and disable the optional predicate cache.
+    /// selectors; predicate caching requires separate cache admission.
     pub fn with_decoder_memory(
         mut self,
         memory: Arc<dyn crate::arrow::memory::DecoderMemory>,
     ) -> Self {
         self.input.memory = Some(memory);
         self.row_selection_policy = crate::arrow::arrow_reader::RowSelectionPolicy::Selectors;
-        self.max_predicate_cache_size = 0;
         self
     }
 
@@ -284,13 +283,11 @@ impl ParquetPushDecoderBuilder {
             max_predicate_cache_size,
         } = self;
 
-        // Admission is independent of builder call order. Mask materialization
-        // can decode unselected rows, and cached predicate arrays need a
-        // separate allocation policy, so neither is enabled in governed scans.
-        let (row_selection_policy, max_predicate_cache_size) = if memory.is_some() {
-            (crate::arrow::arrow_reader::RowSelectionPolicy::Selectors, 0)
+        // Governed cache admission occurs before installing cached readers.
+        let row_selection_policy = if memory.is_some() {
+            crate::arrow::arrow_reader::RowSelectionPolicy::Selectors
         } else {
-            (row_selection_policy, max_predicate_cache_size)
+            row_selection_policy
         };
 
         // If no row groups were specified, read all of them

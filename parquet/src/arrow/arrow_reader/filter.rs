@@ -27,6 +27,12 @@ use std::fmt::{Debug, Formatter};
 ///   Parquet decoding process.
 /// * [`ArrowPredicateFn`] for a concrete implementation based on a function
 pub trait ArrowPredicate: Send + 'static {
+    /// Optional decoder optimization. False skips this predicate before its
+    /// column data is fetched. Mandatory row predicates keep the default.
+    fn should_evaluate(&mut self, _rows: usize) -> bool {
+        true
+    }
+
     /// Returns the [`ProjectionMask`] that describes the columns required
     /// to evaluate this predicate.
     ///

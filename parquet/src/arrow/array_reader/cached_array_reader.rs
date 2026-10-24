@@ -148,6 +148,7 @@ impl CachedArrayReader {
         }
 
         let array = self.inner.consume_batch()?;
+        let array = self.shared_cache.read().unwrap().retain(array)?;
 
         // Store in both shared cache and local cache
         // The shared cache is used to reuse results between readers
