@@ -343,7 +343,7 @@ impl RemainingRowGroups {
     /// needed to proceed
     pub fn try_next_reader(
         &mut self,
-    ) -> Result<DecodeResult<ParquetRecordBatchReader>, ParquetError> {
+    ) -> Result<DecodeResult<Box<ParquetRecordBatchReader>>, ParquetError> {
         loop {
             if !self.row_group_reader_builder.has_active_row_group() {
                 // We are done with the previous row group, seek to the next one

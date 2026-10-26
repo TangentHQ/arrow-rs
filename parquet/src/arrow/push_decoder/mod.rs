@@ -783,7 +783,7 @@ impl ParquetDecoderState {
                         // Transition to decoding the row group
                         Ok((
                             Self::DecodingRowGroup {
-                                record_batch_reader: Box::new(record_batch_reader),
+                                record_batch_reader,
                                 remaining_row_groups,
                             },
                             data_ready,
