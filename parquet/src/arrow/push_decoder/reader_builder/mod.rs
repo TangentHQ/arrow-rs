@@ -194,7 +194,7 @@ pub(crate) enum RowGroupBuildResult {
     NeedsData(Vec<Range<u64>>),
     /// The active row group produced a reader.
     Data {
-        batch_reader: ParquetRecordBatchReader,
+        batch_reader: Box<ParquetRecordBatchReader>,
         /// Budget remaining after applying this row group's selection.
         remaining_budget: RowBudget,
     },
@@ -906,7 +906,7 @@ impl RowGroupReaderBuilder {
                 NextState::result(
                     RowGroupDecoderState::Finished,
                     RowGroupBuildResult::Data {
-                        batch_reader: reader,
+                        batch_reader: Box::new(reader),
                         remaining_budget: budget,
                     },
                 )
