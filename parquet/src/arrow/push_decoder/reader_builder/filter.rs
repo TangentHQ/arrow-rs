@@ -39,6 +39,10 @@ pub(super) struct FilterInfo {
     next_predicate: NonZeroUsize,
     /// Previously computed filter results
     cache_info: CacheInfo,
+    /// The columns of the predicates evaluated so far, `None` until one is.
+    /// A predicate [`ArrowPredicate::should_evaluate`] skips fetches and
+    /// caches nothing.
+    evaluated: Option<ProjectionMask>,
 }
 
 /// Predicate cache
@@ -73,8 +77,9 @@ impl CacheInfo {
 pub(super) enum AdvanceResult {
     /// Advanced to the next predicate
     Continue(FilterInfo),
-    /// No more predicates returns the row filter and cache info
-    Done(RowFilter, CacheInfo),
+    /// No more predicates returns the row filter, and the cache info of the
+    /// columns its evaluated predicates read: none if every one was skipped
+    Done(RowFilter, Option<CacheInfo>),
 }
 
 impl FilterInfo {
@@ -84,6 +89,7 @@ impl FilterInfo {
             filter,
             next_predicate: NonZeroUsize::new(1).expect("1 is always non-zero"),
             cache_info,
+            evaluated: None,
         }
     }
 
@@ -96,7 +102,14 @@ impl FilterInfo {
     ///   if there are no more predicates
     pub(super) fn advance(mut self) -> AdvanceResult {
         if self.next_predicate.get() >= self.filter.predicates.len() {
-            AdvanceResult::Done(self.filter, self.cache_info)
+            // The output reads a column through the cache only where a
+            // predicate filled it. Its request loads no more than the pages
+            // its selection needs, which a whole cache batch may run past.
+            let cache_info = self.evaluated.map(|evaluated| {
+                self.cache_info.cache_projection.intersect(&evaluated);
+                self.cache_info
+            });
+            AdvanceResult::Done(self.filter, cache_info)
         } else {
             self.next_predicate = self
                 .next_predicate
@@ -104,6 +117,20 @@ impl FilterInfo {
                 .expect("no usize overflow");
             AdvanceResult::Continue(self)
         }
+    }
+
+    /// Whether to evaluate the current predicate, remembering its columns if so
+    pub(super) fn should_evaluate(&mut self, rows: usize) -> bool {
+        // advance ensures next_predicate is always in bounds
+        let predicate = &mut self.filter.predicates[self.next_predicate.get() - 1];
+        let evaluate = predicate.should_evaluate(rows);
+        if evaluate {
+            match &mut self.evaluated {
+                Some(evaluated) => evaluated.union(predicate.projection()),
+                None => self.evaluated = Some(predicate.projection().clone()),
+            }
+        }
+        evaluate
     }
 
     /// Return a mutable reference to the current predicate

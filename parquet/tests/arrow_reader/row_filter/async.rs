@@ -27,15 +27,15 @@ use arrow_array::{
     ArrayRef, BooleanArray, Int8Array, Int32Array, Int64Array, RecordBatch, Scalar, StringArray,
     StructArray,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use parquet::{
     arrow::{
         ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask,
         arrow_reader::{
-            ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelectionPolicy,
-            RowSelector, metrics::ArrowReaderMetrics,
+            ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection,
+            RowSelectionPolicy, RowSelector, metrics::ArrowReaderMetrics,
         },
     },
     file::{
@@ -234,6 +234,83 @@ async fn test_cached_mask_reads_sparse_pages_without_error() {
                 > 0,
             "predicate cache was not exercised for policy={policy:?}"
         );
+    }
+}
+
+/// A predicate the decoder is told not to evaluate.
+struct Skipped(ProjectionMask);
+
+impl ArrowPredicate for Skipped {
+    fn should_evaluate(&mut self, _rows: usize) -> bool {
+        false
+    }
+
+    fn projection(&self) -> &ProjectionMask {
+        &self.0
+    }
+
+    fn evaluate(&mut self, _batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+        unreachable!("a skipped predicate is never evaluated")
+    }
+}
+
+/// A skipped predicate fetches nothing, so nothing fills the cache for its
+/// columns and the output reads them as it reads any other column: only the
+/// pages its selection needs. Read through the cache, the 8-row batch at rows
+/// 16..24 crossed into the middle page, which no request had loaded.
+#[tokio::test]
+async fn test_skipped_predicate_columns_are_not_read_through_the_cache() {
+    let values = (0..60).collect::<Vec<i64>>();
+    let data = make_two_column_i64_file(&values, 20);
+
+    // Alone, and after a predicate that is evaluated on the other column.
+    for evaluated in [false, true] {
+        let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+            TestReader::new(data.clone()),
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
+        )
+        .await
+        .unwrap();
+        let schema = builder.parquet_schema().clone();
+        let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
+        if evaluated {
+            predicates.push(Box::new(ArrowPredicateFn::new(
+                ProjectionMask::leaves(&schema, [1]),
+                |batch: RecordBatch| Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+            )));
+        }
+        predicates.push(Box::new(Skipped(ProjectionMask::leaves(&schema, [0]))));
+        let stream = builder
+            .with_projection(ProjectionMask::leaves(&schema, [0, 1]))
+            .with_row_filter(RowFilter::new(predicates))
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(17),
+                RowSelector::select(1),
+                RowSelector::skip(22),
+                RowSelector::select(1),
+                RowSelector::skip(19),
+            ]))
+            .with_batch_size(8)
+            .with_max_predicate_cache_size(1024)
+            .with_row_selection_policy(RowSelectionPolicy::Mask)
+            .build()
+            .unwrap();
+
+        let output_schema = stream.schema().clone();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let output = concat_batches(&output_schema, &batches).unwrap();
+        for column in 0..2 {
+            assert_eq!(
+                output
+                    .column(column)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values(),
+                &[17, 40],
+                "column={column}, evaluated={evaluated}"
+            );
+        }
     }
 }
 

@@ -565,10 +565,7 @@ impl RowGroupReaderBuilder {
                 column_chunks,
                 mut filter_info,
             } => {
-                if !filter_info
-                    .current_mut()
-                    .should_evaluate(row_group_info.row_count)
-                {
+                if !filter_info.should_evaluate(row_group_info.row_count) {
                     return Ok(match filter_info.advance() {
                         AdvanceResult::Continue(filter_info) => {
                             NextState::again(RowGroupDecoderState::Filters {
@@ -582,7 +579,7 @@ impl RowGroupReaderBuilder {
                             NextState::again(RowGroupDecoderState::StartData {
                                 row_group_info,
                                 column_chunks,
-                                cache_info: Some(cache_info),
+                                cache_info,
                             })
                         }
                     });
@@ -759,7 +756,7 @@ impl RowGroupReaderBuilder {
                         NextState::again(RowGroupDecoderState::StartData {
                             row_group_info,
                             column_chunks,
-                            cache_info: Some(cache_info),
+                            cache_info,
                         })
                     }
                 }
