@@ -262,9 +262,16 @@ impl ArrowPredicate for Skipped {
 async fn test_skipped_predicate_columns_are_not_read_through_the_cache() {
     let values = (0..60).collect::<Vec<i64>>();
     let data = make_two_column_i64_file(&values, 20);
+    let policies = [
+        RowSelectionPolicy::Auto { threshold: 32 },
+        RowSelectionPolicy::Mask,
+    ];
 
-    // Alone, and after a predicate that is evaluated on the other column.
-    for evaluated in [false, true] {
+    // After a predicate that is evaluated on the other column, and alone.
+    for (evaluated, policy) in [true, false]
+        .into_iter()
+        .flat_map(|evaluated| policies.map(|policy| (evaluated, policy)))
+    {
         let builder = ParquetRecordBatchStreamBuilder::new_with_options(
             TestReader::new(data.clone()),
             ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required),
@@ -281,7 +288,6 @@ async fn test_skipped_predicate_columns_are_not_read_through_the_cache() {
         }
         predicates.push(Box::new(Skipped(ProjectionMask::leaves(&schema, [0]))));
         let stream = builder
-            .with_projection(ProjectionMask::leaves(&schema, [0, 1]))
             .with_row_filter(RowFilter::new(predicates))
             .with_row_selection(RowSelection::from(vec![
                 RowSelector::skip(17),
@@ -291,26 +297,18 @@ async fn test_skipped_predicate_columns_are_not_read_through_the_cache() {
                 RowSelector::skip(19),
             ]))
             .with_batch_size(8)
-            .with_max_predicate_cache_size(1024)
-            .with_row_selection_policy(RowSelectionPolicy::Mask)
+            .with_row_selection_policy(policy)
             .build()
             .unwrap();
 
-        let output_schema = stream.schema().clone();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
-        let output = concat_batches(&output_schema, &batches).unwrap();
-        for column in 0..2 {
-            assert_eq!(
-                output
-                    .column(column)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values(),
-                &[17, 40],
-                "column={column}, evaluated={evaluated}"
-            );
-        }
+        let output = concat_batches(&batches[0].schema(), &batches).unwrap();
+        let expected: ArrayRef = Arc::new(Int64Array::from(vec![17, 40]));
+        assert_eq!(
+            output.columns(),
+            [expected.clone(), expected],
+            "evaluated={evaluated}, policy={policy:?}"
+        );
     }
 }
 

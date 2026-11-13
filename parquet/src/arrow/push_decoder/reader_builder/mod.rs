@@ -565,7 +565,10 @@ impl RowGroupReaderBuilder {
                 column_chunks,
                 mut filter_info,
             } => {
-                if !filter_info.should_evaluate(row_group_info.row_count) {
+                if !filter_info
+                    .current_mut()
+                    .should_evaluate(row_group_info.row_count)
+                {
                     return Ok(match filter_info.advance() {
                         AdvanceResult::Continue(filter_info) => {
                             NextState::again(RowGroupDecoderState::Filters {
@@ -579,7 +582,7 @@ impl RowGroupReaderBuilder {
                             NextState::again(RowGroupDecoderState::StartData {
                                 row_group_info,
                                 column_chunks,
-                                cache_info,
+                                cache_info: Some(cache_info),
                             })
                         }
                     });
@@ -756,7 +759,7 @@ impl RowGroupReaderBuilder {
                         NextState::again(RowGroupDecoderState::StartData {
                             row_group_info,
                             column_chunks,
-                            cache_info,
+                            cache_info: Some(cache_info),
                         })
                     }
                 }
@@ -796,6 +799,23 @@ impl RowGroupReaderBuilder {
                         RowGroupBuildResult::Finished { remaining_budget },
                     ));
                 }
+
+                // Only a column a predicate fetched can be in the cache. A
+                // predicate that `should_evaluate` skipped fetched nothing, so
+                // its columns are read as any other output column: a cache
+                // miss reads a whole batch, past the pages the request below
+                // loads for the selection.
+                let cache_info =
+                    cache_info
+                        .zip(column_chunks.as_ref())
+                        .map(|(mut cache, chunks)| {
+                            let fetched = chunks.iter().enumerate();
+                            let fetched =
+                                fetched.filter_map(|(leaf, chunk)| chunk.is_some().then_some(leaf));
+                            let schema = self.metadata.file_metadata().schema_descr();
+                            cache.retain(&ProjectionMask::leaves(schema, fetched));
+                            cache
+                        });
 
                 let data_request = DataRequestBuilder::new(
                     row_group_idx,
